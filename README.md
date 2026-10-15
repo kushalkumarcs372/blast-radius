@@ -4,7 +4,7 @@ AI on-call agents that trace blast radius, root cause and ownership through a Fa
 
 **Tracks entered:** 01 Agents That Act on Connected Data (primary) · 02 Agent Memory and Coordination · 03 Company Brain
 
-> Status: Day 2 of 4 — graph tools, three cooperating agents with graph memory, and a question-answering agent. UI and deployment follow.
+> Status: Day 3 of 4 — graph tools, cooperating agents with graph memory, a question-answering agent, an MCP server and a web UI.
 
 ## The problem
 
@@ -30,6 +30,34 @@ python -m blast_radius.cli demo      # run the graph tools on the demo incident
 python -m blast_radius.cli respond   # Triage -> Investigator -> Responder on the open alert
 pytest                               # data, query, agent and LLM checks
 ```
+
+### Web UI
+
+```bash
+uvicorn blast_radius.api:app --reload
+```
+
+Open http://localhost:8000. Click **Run agents** on the open alert: the map dims everything except the services at risk (orange), the alerting service (red) and the link to the suspect deploy (blue dashed). The right panel shows each agent's summary with the graph nodes it cites, the Cypher it ran, the proposed actions, and an **Ask the graph** box. Click any service on the map to preview its blast radius.
+
+### MCP server
+
+The same graph tools are exposed over the Model Context Protocol, so any MCP client can drive them. For Claude Desktop, add to `claude_desktop_config.json` (adjust the paths):
+
+```json
+{
+  "mcpServers": {
+    "blast-radius": {
+      "command": "D:\\path\\to\\blast-radius\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "blast_radius.mcp_server"],
+      "cwd": "D:\\path\\to\\blast-radius"
+    }
+  }
+}
+```
+
+Tools exposed: `tenants`, `open_alerts`, `blast_radius`, `dependencies`, `recent_deploys`, `critical_services`, `connection_path`, `owners`, `fix_history`, `similar_incidents`, `runbook`, `decision_trace`, `incident_memory`, `list_incidents`, `respond_to_alert`.
+
+### Command line
 
 Agents work without API keys (they fall back to template summaries). For LLM-written summaries and free-form questions, add `GEMINI_API_KEY` and/or `GROQ_API_KEY` to `.env`, then:
 
@@ -130,6 +158,10 @@ All queries live in `blast_radius/tools/graph_tools.py`. Hop limits are validate
 ## How the queries are verified
 
 `tests/test_graph_tools.py` loads a generated company into FalkorDB, runs each tool, and compares the result with an independent breadth-first search in plain Python (`blast_radius/seed/reference.py`) over the same data. `tests/test_agents.py` runs the three agents and the assistant on FalkorDB with a scripted fake LLM, so no API key is needed: it checks the agents pick the right deploy, write the handoff chain into the graph, and that memory is readable from a new connection. `tests/test_llm.py` checks provider fallback and that invented citations are rejected. `tests/test_generator.py` checks the data itself: no dependency cycles, every edge points at a real node, one owner per service, one on-call person per team, no future timestamps.
+
+## Deployment
+
+The API and UI ship as one Docker image (`Dockerfile`); FalkorDB runs as a managed FalkorDB Cloud instance. `render.yaml` describes the Render web service. Set `FALKORDB_HOST`, `FALKORDB_PORT`, `FALKORDB_USERNAME`, `FALKORDB_PASSWORD`, `GROQ_API_KEY` and `GEMINI_API_KEY` as environment variables. On first start against an empty database the API loads the synthetic companies. `/api/ask` is rate limited per IP to protect the free LLM quotas.
 
 ## Data
 

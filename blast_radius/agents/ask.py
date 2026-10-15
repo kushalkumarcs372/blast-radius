@@ -68,7 +68,8 @@ def history(g, session: str, limit: int = 6) -> list[dict]:
 def ask(g, question: str, llm, session: str, incident: str | None = None) -> dict:
     memory.ensure_agents(g)
     if llm is None or not llm.providers:
-        return {"answer": "No LLM key configured. Add GEMINI_API_KEY or GROQ_API_KEY to .env.", "steps": []}
+        return {"question": question, "answer": "No LLM key configured. Add GEMINI_API_KEY or GROQ_API_KEY to .env.",
+                "tools": [], "invented_ids": [], "cited": [], "provider": None}
 
     system = SYSTEM.format(tools="\n".join(f"- {d}" for d in TOOL_DOCS.values()))
     earlier = history(g, session)
