@@ -7,7 +7,9 @@ from .. import memory
 from ..tools import graph_tools as T
 from .base import summarize
 
-ROLE = "You compare the current incident with past ones and name the most likely cause, with a confidence."
+ROLE = ("You compare the current incident with past ones and name the most likely cause, with a confidence. "
+        "In similar_past_incidents, change_that_caused_it is the change that CAUSED that past incident, "
+        "never the fix. Do not recommend actions; the Responder agent does that.")
 WINDOW_MIN = 6 * 60
 
 
@@ -72,14 +74,14 @@ def run(g, incident: str, session: str, llm=None) -> dict:
                         ("deployment", "service", "summary", "author", "minutes_before_alert", "confidence")},
         "other_suspects": [{"deployment": a["deployment"], "confidence": a["confidence"]} for a in assessed[1:]],
         "similar_past_incidents": [
-            {k: h[k] for k in ("incident", "title", "cause_summary", "resolved_by", "minutes_to_resolve", "score")}
+            {k: h[k] for k in ("incident", "title", "change_that_caused_it", "resolved_by", "minutes_to_resolve", "score")}
             for h in history if h
         ],
     }
     if likely:
         match = likely["best_match"]
         past = (f" A past incident [{match['incident']}] had the same signal; its cause was "
-                f"'{match['cause_summary']}' and {match['resolved_by']} resolved it in "
+                f"'{match['change_that_caused_it']}' and {match['resolved_by']} resolved it in "
                 f"{match['minutes_to_resolve']} min." if match and match["score"] >= 3 else "")
         fallback = (f"Likely cause: [{likely['deployment']}] '{likely['summary']}' on {likely['service']}, "
                     f"deployed {likely['minutes_before_alert']} min before the alert "

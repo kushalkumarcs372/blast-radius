@@ -4,6 +4,7 @@ Every tool returns a ToolResult holding the rows, the graph paths that support
 them (``evidence``) and the exact Cypher that ran, so an answer can always be
 traced back to the graph.
 """
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -286,7 +287,7 @@ def similar_incidents(g, service: str, signal: str = "", suspect_summary: str = 
         scored.append(({
             "incident": inc, "title": title, "started": started,
             "minutes_to_resolve": (resolved - started) // 60_000 if resolved else None,
-            "signal": sig, "cause_deployment": dep, "cause_summary": dsum, "cause_service": dsvc,
+            "signal": sig, "cause_deployment": dep, "change_that_caused_it": dsum, "cause_service": dsvc,
             "resolved_by": fixer, "postmortem": doc, "score": round(score, 2),
         }, [x for x in (fixer, inc, service) if x]))
     scored.sort(key=lambda x: (-x[0]["score"], -x[0]["started"]))
@@ -314,17 +315,22 @@ def decision_trace(g, service: str) -> ToolResult:
     params = {"service": service}
     if not _service_exists(g, service):
         return _missing("decision_trace", params, service)
+    # A decision counts if it is attached to the service, or its text names the service as a
+    # whole word (ADR-003 is about `payments` but explains why `postgres-payments` exists;
+    # `auth` must not match "authorisation"). The word match runs in Python on the few rows returned.
     q = (
-        "MATCH (d:Decision)-[:ABOUT]->(s:Service {name: $service}) "
+        "MATCH (d:Decision)-[:ABOUT]->(about:Service) "
         "MATCH (d)-[:SOURCED_FROM]->(doc:Document) "
-        "RETURN d.id, d.title, d.summary, doc.id, doc.title, doc.source ORDER BY d.date DESC"
+        "RETURN d.id, d.title, d.summary, doc.id, doc.title, doc.source, about.name, d.date AS date "
+        "ORDER BY date DESC"
     )
-    rows = _rows(g, q, {"service": service})
+    word = re.compile(rf"(?<![\w-]){re.escape(service)}(?![\w-])")
+    rows = [r for r in _rows(g, q) if r[6] == service or word.search(r[2] or "")]
     return ToolResult(
         "decision_trace", params,
-        [{"decision": d, "title": t, "summary": s, "document": di, "document_title": dt, "source": src}
-         for d, t, s, di, dt, src in rows],
-        evidence=[[service, d, di] for d, _, _, di, _, _ in rows], cypher=[q],
+        [{"decision": d, "title": t, "summary": s, "document": di, "document_title": dt, "source": src,
+          "about_service": ab} for d, t, s, di, dt, src, ab, _ in rows],
+        evidence=[[service, d, di] for d, _, _, di, _, _, _, _ in rows], cypher=[q],
     )
 
 

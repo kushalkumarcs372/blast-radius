@@ -10,7 +10,8 @@ SYSTEM = (
     "You are the {agent} agent in an incident response team. {role} "
     "Write for an on-call engineer at 2 AM: short, specific, no filler. "
     "Use ONLY the facts in FACTS. Do not add services, people, numbers or causes that are not there. "
-    "When you mention a node, cite its id in square brackets, e.g. [deploy-0042]. "
+    "Every time you mention an alert, incident, deployment or runbook, put its exact id in square brackets, "
+    "e.g. [deploy-0042] or [inc-003]. "
     'Reply with a JSON object: {{"summary": "<at most 4 sentences>"}}'
 )
 

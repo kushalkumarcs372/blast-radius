@@ -143,3 +143,22 @@ def test_tenants_are_isolated(db, g, acme):
     # The demo deploy exists only in acme's graph.
     assert other.query("MATCH (d:Deployment {id: 'deploy-demo-suspect'}) RETURN count(d)").result_set[0][0] == 0
     assert g.query("MATCH (d:Deployment {id: 'deploy-demo-suspect'}) RETURN count(d)").result_set[0][0] == 1
+
+
+def test_decision_trace_finds_decisions_attached_or_mentioning(g):
+    direct = T.decision_trace(g, "auth")
+    assert [r["document"] for r in direct.results] == ["doc-adr-00"]
+    # ADR-003 is attached to `payments` but its text explains `postgres-payments`.
+    db = T.decision_trace(g, "postgres-payments")
+    assert ("decision-01", "payments", "doc-adr-01") in [
+        (r["decision"], r["about_service"], r["document"]) for r in db.results
+    ]
+    assert T.decision_trace(g, "web-frontend").results == []
+
+
+def test_similar_incidents_ranks_the_demo_match_first(g):
+    res = T.similar_incidents(g, "postgres-payments", "Connection pool exhausted",
+                              "Raise connection pool size from 50 to 400", "payments")
+    top = res.results[0]
+    assert top["incident"] == "inc-demo-old" and top["score"] >= 5
+    assert top["change_that_caused_it"] == "Raise connection pool size"

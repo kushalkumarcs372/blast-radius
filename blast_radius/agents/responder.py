@@ -69,6 +69,7 @@ def run(g, incident: str, session: str, llm=None) -> dict:
         "incident": incident, "service": service, "likely_cause": cause,
         "owning_team": team_c["team"] if team_c else None, "on_call": oncall_c["name"] if oncall_c else None,
         "expert": expert["person"] if expert else None, "actions": actions,
+        "node_ids": sorted({node_id for _, node_id in cites}),
     }
     fallback = " ".join(f"{i}. {a}" for i, a in enumerate(actions[:3], 1)) or "No owner or runbook found."
     summary, source = summarize(llm, "responder", ROLE, facts, fallback)
