@@ -13,6 +13,8 @@ services:
         sync: false
       - key: FALKORDB_PASSWORD
         sync: false
+      - key: FALKORDB_TLS
+        value: "false"
       - key: LLM_PROVIDER
         value: groq
       - key: GROQ_MODEL

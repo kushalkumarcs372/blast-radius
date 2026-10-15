@@ -22,6 +22,7 @@ def client() -> FalkorDB:
             port=settings.falkordb_port,
             username=settings.falkordb_username,
             password=settings.falkordb_password,
+            ssl=settings.falkordb_tls,
         )
     return _client
 
