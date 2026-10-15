@@ -37,7 +37,9 @@ SYSTEM = (
     "Call one tool at a time. Available tools:\n{tools}\n\n"
     'To call a tool reply {{"tool": "<name>", "args": {{...}}}}. '
     'When you can answer, reply {{"answer": "<2-5 sentences>"}} and cite node ids from tool results in square '
-    "brackets, e.g. [inc-003] or [deploy-0042]. If the tools cannot answer, say so."
+    "brackets, e.g. [inc-003] or [deploy-0042]. If the tools cannot answer, say so. "
+    "Questions about a current or recent alert or incident: use incident_memory on the incident listed "
+    "under OPEN INCIDENTS first; it already holds the agents' findings."
 )
 
 
@@ -72,6 +74,8 @@ def ask(g, question: str, llm, session: str, incident: str | None = None) -> dic
     earlier = history(g, session)
     past = [{"q": h["question"], "a": h["answer"]} for h in earlier]
     transcript = [f"Earlier in this conversation: {json.dumps(past)}"] if past else []
+    open_now = memory.list_incidents(g)
+    transcript.append(f"OPEN INCIDENTS: {json.dumps(open_now, default=str)}")
     if incident:
         transcript.append(f"The engineer is asking about incident {incident}.")
     transcript.append(f"QUESTION: {question}")

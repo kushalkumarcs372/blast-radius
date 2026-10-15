@@ -121,7 +121,7 @@ def ask_cmd(tenant: str, argv: list[str]) -> None:
     session = _opt(argv, "--session", "cli")
     incident = _opt(argv, "--incident")
     out = ask(graph(tenant), " ".join(argv), from_env(), session, incident)
-    for s in out["steps"]:
+    for s in out.get("tools", []):
         print(f"  tool: {s['tool']}({s['args']})")
     print("\n" + out["answer"])
     if out.get("invented_ids"):

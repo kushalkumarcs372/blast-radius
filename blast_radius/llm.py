@@ -93,8 +93,13 @@ class Groq(Provider):
             {
                 "model": self.model,
                 "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                # No strict JSON mode: reasoning models (gpt-oss) often fail Groq's validator.
+                # We ask for JSON in the prompt and extract it ourselves.
+                **({"reasoning_effort": "low"} if "gpt-oss" in self.model else {}),
+                "messages": [
+                    {"role": "system", "content": system + " Respond with a single JSON object and nothing else."},
+                    {"role": "user", "content": prompt},
+                ],
             },
         )
         return _parse_json(data["choices"][0]["message"]["content"])
@@ -121,7 +126,7 @@ class LLM:
 
 
 def from_env() -> LLM:
-    gemini = Gemini("gemini", os.getenv("GEMINI_MODEL", "gemini-flash-latest"), os.getenv("GEMINI_API_KEY", ""))
-    groq = Groq("groq", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), os.getenv("GROQ_API_KEY", ""))
+    gemini = Gemini("gemini", os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"), os.getenv("GEMINI_API_KEY", ""))
+    groq = Groq("groq", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), os.getenv("GROQ_API_KEY", ""))
     order = [groq, gemini] if os.getenv("LLM_PROVIDER", "gemini").lower() == "groq" else [gemini, groq]
     return LLM([p for p in order if p.api_key])
