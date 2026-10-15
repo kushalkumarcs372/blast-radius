@@ -6,13 +6,14 @@ Every call asks for a JSON object back so the output can be checked.
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
 from . import config  # noqa: F401  (loads .env before keys are read)
 
-TIMEOUT_S = 30
+TIMEOUT_S = 20
 
 
 class LLMUnavailable(RuntimeError):
@@ -29,12 +30,29 @@ class Provider:
         raise NotImplementedError
 
 
-def _post(url: str, headers: dict, body: dict) -> dict:
+class ProviderError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+
+
+def _post(url: str, headers: dict, body: dict, retries: int = 2) -> dict:
+    # A real User-Agent matters: some API gateways reject Python's default one with 403.
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **headers}, method="POST"
+        url, data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "blast-radius/0.2", **headers},
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-        return json.loads(resp.read().decode())
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:300].replace("\n", " ")
+            # 503 = model overloaded: worth one or two quick retries before falling back.
+            if exc.code in (500, 502, 503) and attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise ProviderError(exc.code, detail) from None
 
 
 def _parse_json(text: str) -> dict:
@@ -97,8 +115,6 @@ class LLM:
                 out = p.complete_json(system, prompt)
                 self.last_provider = f"{p.name}:{p.model}"
                 return out
-            except urllib.error.HTTPError as exc:
-                self.errors.append(f"{p.name}: HTTP {exc.code}")
             except Exception as exc:  # timeout, bad JSON, network
                 self.errors.append(f"{p.name}: {type(exc).__name__}: {exc}"[:200])
         raise LLMUnavailable("; ".join(self.errors) or "no LLM provider configured")

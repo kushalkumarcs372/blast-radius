@@ -1,10 +1,8 @@
 """LLM client and summary guard. No network or database needed."""
-import urllib.error
-
 import pytest
 
 from blast_radius.agents.base import known_ids, summarize
-from blast_radius.llm import LLM, LLMUnavailable, Provider, _parse_json
+from blast_radius.llm import LLM, LLMUnavailable, Provider, ProviderError, _parse_json
 
 
 class Fake(Provider):
@@ -20,7 +18,7 @@ class Fake(Provider):
 
 
 def http_error(code):
-    return urllib.error.HTTPError("https://x", code, "err", {}, None)
+    return ProviderError(code, "err")
 
 
 def test_first_provider_used_when_healthy():
