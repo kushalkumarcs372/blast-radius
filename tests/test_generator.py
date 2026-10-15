@@ -1,0 +1,99 @@
+"""Checks on the synthetic data itself. These need no database."""
+from collections import defaultdict
+
+from blast_radius.seed import catalog, reference
+from blast_radius.seed.generator import DAY, MINUTE, TENANTS, generate
+
+NOW = 1_792_000_000_000  # fixed clock so results are repeatable
+
+
+def test_generation_is_deterministic():
+    a, b = generate("acme", NOW), generate("acme", NOW)
+    assert a.nodes == b.nodes and a.edges == b.edges
+
+
+def test_every_edge_points_at_existing_nodes():
+    for tenant in TENANTS:
+        data = generate(tenant, NOW)
+        ids = {label: {n["id"] for n in rows} for label, rows in data.nodes.items()}
+        for rel, edges in data.edges.items():
+            for src_label, src, dst_label, dst, _ in edges:
+                assert src in ids[src_label], (rel, src)
+                assert dst in ids[dst_label], (rel, dst)
+
+
+def test_ids_are_unique_per_label():
+    data = generate("acme", NOW)
+    for label, rows in data.nodes.items():
+        ids = [r["id"] for r in rows]
+        assert len(ids) == len(set(ids)), label
+
+
+def test_dependency_graph_has_no_cycles():
+    adj = defaultdict(list)
+    for src, dst in catalog.DEPENDENCIES:
+        adj[src].append(dst)
+    state = {}
+
+    def visit(n):
+        state[n] = "open"
+        for m in adj[n]:
+            assert state.get(m) != "open", f"cycle through {n} -> {m}"
+            if m not in state:
+                visit(m)
+        state[n] = "done"
+
+    for s in catalog.SERVICES:
+        if s not in state:
+            visit(s)
+
+
+def test_every_service_has_one_owner_and_every_team_one_on_call():
+    data = generate("acme", NOW)
+    owned = [b for _, _, _, b, _ in data.edges["OWNS"]]
+    assert sorted(owned) == sorted(s["id"] for s in data.nodes["Service"])
+    on_call = defaultdict(int)
+    team_of = {p: t for _, p, _, t, _ in data.edges["MEMBER_OF"]}
+    for p in data.nodes["Person"]:
+        on_call[team_of[p["id"]]] += p["on_call"]
+    assert set(on_call.values()) == {1}
+
+
+def test_no_timestamps_in_the_future():
+    data = generate("acme", NOW)
+    for label in ("Deployment", "Alert", "Incident"):
+        for n in data.nodes[label]:
+            assert n.get("ts", n.get("started")) <= NOW
+            assert n.get("resolved", 0) <= NOW
+
+
+def test_demo_scenario_is_present_in_acme_only():
+    acme = generate("acme", NOW)
+    suspect = next(d for d in acme.nodes["Deployment"] if d["id"] == "deploy-demo-suspect")
+    assert suspect["service"] == "payments" and suspect["ts"] == NOW - 40 * MINUTE
+    assert "postgres-payments" in reference.dependencies(acme, "payments", 1)
+    # It must be the only deploy in the payments neighbourhood in the last 6 hours.
+    assert reference.recent_deploys(acme, "postgres-payments", NOW - 6 * 60 * MINUTE) == {"deploy-demo-suspect"}
+    for tenant in ("globex", "initech"):
+        assert not any(d["id"].startswith("deploy-demo") for d in generate(tenant, NOW).nodes["Deployment"])
+
+
+def test_postgres_payments_outage_reaches_the_edge():
+    acme = generate("acme", NOW)
+    radius = reference.blast_radius(acme, "postgres-payments")
+    assert {"payments", "refunds", "loyalty", "checkout", "api-gateway"} <= set(radius)
+    assert radius["payments"] == 1 and radius["api-gateway"] == 3
+
+
+def test_tenants_have_different_people():
+    names = {t: {p["name"] for p in generate(t, NOW).nodes["Person"]} for t in TENANTS}
+    assert names["acme"] != names["globex"] != names["initech"]
+
+
+def test_sizes_match_the_plan():
+    data = generate("acme", NOW)
+    assert len(data.nodes["Service"]) == len(catalog.SERVICES) >= 35
+    assert len(data.nodes["Deployment"]) == 150 + 2
+    assert len(data.nodes["Incident"]) == 25 + 1
+    assert 27 <= len(data.nodes["Person"]) <= 36
+    assert all(d["ts"] >= NOW - 30 * DAY - 1 for d in data.nodes["Deployment"])
