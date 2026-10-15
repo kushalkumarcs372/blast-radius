@@ -235,8 +235,11 @@ async function loadAlerts() {
       <div class="body"><div class="title">${esc(a.signal)}</div>
         <div class="meta"><span class="mono">${esc(a.service)}</span> · ${esc(a.severity)} · ${ago(a.ts)}</div></div>
       <button class="primary" data-alert="${esc(a.alert)}">Run agents</button>
-    </div>`).join("") : `<div class="empty">No open alerts. Use “Reset demo” to fire the demo alert again.</div>`;
-  $("alerts").querySelectorAll("button").forEach((b) => b.onclick = () => respond(b.dataset.alert, b));
+    </div>`).join("") : `<div class="row" style="justify-content:space-between">
+      <div class="empty">No open alerts. The agents already handled the demo alert; open it under Past sessions, or fire it again.</div>
+      <button class="primary" id="refire">Fire demo alert</button></div>`;
+  $("alerts").querySelectorAll("button[data-alert]").forEach((b) => b.onclick = () => respond(b.dataset.alert, b));
+  if ($("refire")) $("refire").onclick = () => $("reset").click();
 }
 async function loadIncidents() {
   const list = await api(`/api/incidents?tenant=${state.tenant}`);
@@ -311,6 +314,9 @@ async function switchTenant(t) {
   state.tenant = t; state.incident = null;
   $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("answer").innerHTML = "";
   await loadGraph(); await loadAlerts(); await loadIncidents(); renderSuggestions();
+  // A visitor arriving after the alert was handled sees the latest incident instead of an empty map.
+  const [alerts, incidents] = await Promise.all([api(`/api/alerts?tenant=${t}`), api(`/api/incidents?tenant=${t}`)]);
+  if (!alerts.length && incidents.length) await showIncident(incidents[0].incident);
 }
 $("tenant").onchange = (e) => switchTenant(e.target.value);
 $("ask").onclick = ask;
