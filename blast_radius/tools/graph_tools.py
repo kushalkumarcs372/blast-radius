@@ -95,22 +95,23 @@ def recent_deploys(g, service: str, hours: int = 24, now_ms: int | None = None, 
     params = {"service": service, "hours": hours, "radius": radius}
     if not _service_exists(g, service):
         return _missing("recent_deploys", params, service)
-    since = (now_ms if now_ms is not None else int(time.time() * 1000)) - hours * HOUR_MS
+    until = now_ms if now_ms is not None else int(time.time() * 1000)
+    since = until - hours * HOUR_MS
     q_self = (
         "MATCH (a:Person)-[:AUTHORED]->(d:Deployment)-[:CHANGED]->(s:Service {name: $service}) "
-        "WHERE d.ts >= $since "
+        "WHERE d.ts >= $since AND d.ts <= $until "
         "RETURN d.id, d.version, d.ts, d.summary, s.name, a.name, 0, [s.name]"
     )
     q_near = (
         f"MATCH p = (s:Service {{name: $service}})-[:DEPENDS_ON*1..{_hops(radius)}]-(n:Service) "
         "MATCH (a:Person)-[:AUTHORED]->(d:Deployment)-[:CHANGED]->(n) "
-        "WHERE d.ts >= $since "
+        "WHERE d.ts >= $since AND d.ts <= $until "
         "RETURN d.id, d.version, d.ts, d.summary, n.name, a.name, length(p), [x IN nodes(p) | x.name]"
     )
     found: dict[str, tuple] = {}
     for q in (q_self, q_near):
         for dep_id, version, ts, summary, svc, author, hops, path in _rows(
-            g, q, {"service": service, "since": since}
+            g, q, {"service": service, "since": since, "until": until}
         ):
             if dep_id not in found or hops < found[dep_id][0]["hops"]:
                 found[dep_id] = ({
@@ -191,14 +192,14 @@ def owners(g, service: str) -> ToolResult:
     q = (
         "MATCH (t:Team)-[:OWNS]->(s:Service {name: $service}) "
         "OPTIONAL MATCH (p:Person)-[:MEMBER_OF]->(t) "
-        "RETURN t.name, t.channel, p.name, p.role, p.on_call"
+        "RETURN t.name, t.channel, p.name, p.role, p.on_call, p.id"
     )
     rows = _rows(g, q, {"service": service})
     if not rows:
         return ToolResult("owners", params, [], cypher=[q], error="no owning team recorded")
     team, channel = rows[0][0], rows[0][1]
     people = sorted(
-        ({"name": n, "role": r, "on_call": bool(oc)} for _, _, n, r, oc in rows if n),
+        ({"name": n, "role": r, "on_call": bool(oc), "id": pid} for _, _, n, r, oc, pid in rows if n),
         key=lambda p: (not p["on_call"], p["name"]),
     )
     return ToolResult(
@@ -218,19 +219,120 @@ def fix_history(g, service: str) -> ToolResult:
     q = (
         "MATCH (p:Person)-[:RESOLVED]->(i:Incident)-[:AFFECTED]->(s:Service {name: $service}) "
         "OPTIONAL MATCH (p)-[:MEMBER_OF]->(t:Team) "
-        "RETURN p.name, t.name, count(DISTINCT i) AS fixes, collect(DISTINCT i.id) "
-        "ORDER BY fixes DESC, p.name"
+        "RETURN p.name AS person, t.name, count(DISTINCT i) AS fixes, collect(DISTINCT i.id), p.id "
+        "ORDER BY fixes DESC, person"
     )
     rows = _rows(g, q, {"service": service})
     return ToolResult(
         "fix_history", params,
-        [{"person": p, "team": t, "fixes": n, "incidents": sorted(ids)} for p, t, n, ids in rows],
-        evidence=[[p, i, service] for p, _, _, ids in rows for i in sorted(ids)],
+        [{"person": p, "team": t, "fixes": n, "incidents": sorted(ids), "id": pid} for p, t, n, ids, pid in rows],
+        evidence=[[p, i, service] for p, _, _, ids, _ in rows for i in sorted(ids)],
         cypher=[q],
     )
 
 
+# --- alerts that have no incident yet -----------------------------------------
+
+def open_alerts(g) -> ToolResult:
+    q = (
+        "MATCH (a:Alert)-[:FIRED_ON]->(s:Service) "
+        "OPTIONAL MATCH (i:Incident)-[:TRIGGERED_BY]->(a) "
+        "WITH a, s, i WHERE i IS NULL "
+        "RETURN a.id, a.signal, a.severity, a.ts, s.name ORDER BY a.ts DESC"
+    )
+    rows = _rows(g, q)
+    return ToolResult(
+        "open_alerts", {},
+        [{"alert": a, "signal": sig, "severity": sev, "ts": ts, "service": s} for a, sig, sev, ts, s in rows],
+        evidence=[[a, s] for a, _, _, _, s in rows],
+        cypher=[q],
+    )
+
+
+# --- Q6: which past incidents look like this one? -----------------------------
+
+def _words(text: str | None) -> set[str]:
+    return {w for w in (text or "").lower().replace(":", " ").split() if len(w) > 3}
+
+
+def similar_incidents(g, service: str, signal: str = "", suspect_summary: str = "",
+                      suspect_service: str = "", limit: int = 5) -> ToolResult:
+    """Past resolved incidents that affected this service, scored by how much they resemble now.
+
+    score = 3 if the alert signal matches + 2 if the cause was a deploy to the same service
+            as today's suspect + 2 x word overlap between the two change summaries.
+    """
+    params = {"service": service, "signal": signal, "suspect_service": suspect_service}
+    if not _service_exists(g, service):
+        return _missing("similar_incidents", params, service)
+    q = (
+        "MATCH (past:Incident)-[:AFFECTED]->(s:Service {name: $service}) "
+        "WHERE past.status = 'resolved' "
+        "OPTIONAL MATCH (past)-[:TRIGGERED_BY]->(al:Alert) "
+        "OPTIONAL MATCH (past)-[:CAUSED_BY]->(d:Deployment)-[:CHANGED]->(ds:Service) "
+        "OPTIONAL MATCH (fixer:Person)-[:RESOLVED]->(past) "
+        "OPTIONAL MATCH (doc:Document)-[:MENTIONS]->(past) "
+        "RETURN past.id, past.title, past.started, past.resolved, al.signal, "
+        "d.id, d.summary, ds.name, fixer.name, doc.title"
+    )
+    scored = []
+    suspect_words = _words(suspect_summary)
+    for inc, title, started, resolved, sig, dep, dsum, dsvc, fixer, doc in _rows(g, q, {"service": service}):
+        overlap = 0.0
+        if suspect_words and dsum:
+            w = _words(dsum)
+            overlap = len(w & suspect_words) / max(1, len(w | suspect_words))
+        score = 3 * (bool(signal) and sig == signal) + 2 * (bool(suspect_service) and dsvc == suspect_service) + 2 * overlap
+        scored.append(({
+            "incident": inc, "title": title, "started": started,
+            "minutes_to_resolve": (resolved - started) // 60_000 if resolved else None,
+            "signal": sig, "cause_deployment": dep, "cause_summary": dsum, "cause_service": dsvc,
+            "resolved_by": fixer, "postmortem": doc, "score": round(score, 2),
+        }, [x for x in (fixer, inc, service) if x]))
+    scored.sort(key=lambda x: (-x[0]["score"], -x[0]["started"]))
+    top = scored[:limit]
+    return ToolResult("similar_incidents", params, [r for r, _ in top],
+                      evidence=[p for _, p in top], cypher=[q])
+
+
+# --- runbook for a service ----------------------------------------------------
+
+def runbook(g, service: str) -> ToolResult:
+    params = {"service": service}
+    if not _service_exists(g, service):
+        return _missing("runbook", params, service)
+    q = "MATCH (r:Runbook)-[:FOR]->(s:Service {name: $service}) RETURN r.id, r.title, r.steps"
+    rows = _rows(g, q, {"service": service})
+    return ToolResult("runbook", params,
+                      [{"runbook": i, "title": t, "steps": st} for i, t, st in rows],
+                      evidence=[[i, service] for i, _, _ in rows], cypher=[q])
+
+
+# --- Q10: why is X built this way? --------------------------------------------
+
+def decision_trace(g, service: str) -> ToolResult:
+    params = {"service": service}
+    if not _service_exists(g, service):
+        return _missing("decision_trace", params, service)
+    q = (
+        "MATCH (d:Decision)-[:ABOUT]->(s:Service {name: $service}) "
+        "MATCH (d)-[:SOURCED_FROM]->(doc:Document) "
+        "RETURN d.id, d.title, d.summary, doc.id, doc.title, doc.source ORDER BY d.date DESC"
+    )
+    rows = _rows(g, q, {"service": service})
+    return ToolResult(
+        "decision_trace", params,
+        [{"decision": d, "title": t, "summary": s, "document": di, "document_title": dt, "source": src}
+         for d, t, s, di, dt, src in rows],
+        evidence=[[service, d, di] for d, _, _, di, _, _ in rows], cypher=[q],
+    )
+
+
 TOOLS = {
+    "open_alerts": open_alerts,
+    "similar_incidents": similar_incidents,
+    "runbook": runbook,
+    "decision_trace": decision_trace,
     "blast_radius": blast_radius,
     "dependencies": dependencies,
     "recent_deploys": recent_deploys,

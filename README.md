@@ -4,7 +4,7 @@ AI on-call agents that trace blast radius, root cause and ownership through a Fa
 
 **Tracks entered:** 01 Agents That Act on Connected Data (primary) · 02 Agent Memory and Coordination · 03 Company Brain
 
-> Status: Day 1 of 4 — graph model, synthetic data and graph tools. Agents, UI and deployment follow.
+> Status: Day 2 of 4 — graph tools, three cooperating agents with graph memory, and a question-answering agent. UI and deployment follow.
 
 ## The problem
 
@@ -27,7 +27,16 @@ copy .env.example .env               # macOS/Linux: cp .env.example .env
 
 python -m blast_radius.cli seed      # load 3 synthetic companies
 python -m blast_radius.cli demo      # run the graph tools on the demo incident
-pytest                               # data checks + query checks against FalkorDB
+python -m blast_radius.cli respond   # Triage -> Investigator -> Responder on the open alert
+pytest                               # data, query, agent and LLM checks
+```
+
+Agents work without API keys (they fall back to template summaries). For LLM-written summaries and free-form questions, add `GEMINI_API_KEY` and/or `GROQ_API_KEY` to `.env`, then:
+
+```bash
+python -m blast_radius.cli llm-check
+python -m blast_radius.cli ask "What caused the payments alert and who fixed it last time?"
+python -m blast_radius.cli memory inc-alert-demo-live
 ```
 
 Run one tool directly:
@@ -36,6 +45,21 @@ Run one tool directly:
 python -m blast_radius.cli tool blast_radius service=kafka
 python -m blast_radius.cli tool connection_path source=mobile-bff target=token-store
 ```
+
+## Agents
+
+Three agents handle an alert in order. They do not pass findings to each other in code: each writes an `Episode` node and the next one reads it back from the graph, so a later session (or another process) sees exactly the same shared state.
+
+| Agent | Reads from the graph | Writes to the graph |
+| --- | --- | --- |
+| Triage | `blast_radius`, `recent_deploys` (6 h before the alert), `critical_services` | `Incident`, `AT_RISK` edges, Episode citing the alert, services and suspect deploys |
+| Investigator | Triage's Episode, `similar_incidents` for each suspect | `SUSPECTED_CAUSE {confidence}`, `SIMILAR_TO {score}`, Episode citing deploys and past incidents |
+| Responder | Investigator's Episode, `owners`, `fix_history`, `runbook`, `decision_trace` | Proposed actions, incident status, Episode citing people, runbook and design docs |
+| Assistant | Any tool above plus incident memory, chosen by the LLM one call at a time | Each question and answer as an Episode, so the conversation continues across sessions |
+
+**The graph decides, the LLM explains.** Which services are at risk, which deploy is suspected, and who to page all come from Cypher. The LLM writes the summaries and, for follow-up questions, chooses which fixed tool to call; it never writes Cypher. A summary that cites a node id not present in the facts is rejected and replaced by a template. Gemini is tried first and Groq is the fallback; if both are rate limited the agents still finish.
+
+Suspect confidence = 35% recency (deployed closer to the alert) + 25% proximity (on the alerting service or a direct neighbour) + 40% history (a past incident with the same signal and a similar change).
 
 ## Graph data model
 
@@ -68,6 +92,19 @@ Each company is a separate named graph (`tenant_acme`, `tenant_globex`, `tenant_
 (Document)-[:MENTIONS]->(Incident)
 ```
 
+Agent memory:
+
+```
+(Agent)-[:RECORDED]->(Episode)-[:ABOUT]->(Incident)
+(Episode)-[:HANDED_OFF_TO]->(Agent)
+(Episode)-[:CITES]->(Service | Deployment | Person | Incident | Runbook | Document | Alert)
+(Incident)-[:AT_RISK {hops}]->(Service)
+(Incident)-[:SUSPECTED_CAUSE {confidence}]->(Deployment)
+(Incident)-[:SIMILAR_TO {score}]->(Incident)
+```
+
+Episodic memory is the `Episode` nodes, semantic memory is the company graph, and procedural memory is `Runbook` nodes plus `SIMILAR_TO` links to past fixes.
+
 Indexes: `id` on every label, plus `Service.name`, `Team.name` and `Deployment.ts` (see `blast_radius/schema.py`).
 
 The `acme` tenant has 38 services, 54 dependencies, 9 teams, about 30 people, 152 deployments, 26 incidents, runbooks and design decisions (about 330 nodes and 630 edges).
@@ -85,10 +122,14 @@ All queries live in `blast_radius/tools/graph_tools.py`. Hop limits are validate
 | `connection_path` | How are A and B connected? | `WITH shortestPath((a)-[:DEPENDS_ON*]->(b)) AS p RETURN [n IN nodes(p) \| n.name]` |
 | `owners` | Who owns X, who is on call? | `MATCH (t:Team)-[:OWNS]->(s:Service {name: $service}) OPTIONAL MATCH (p:Person)-[:MEMBER_OF]->(t) RETURN ...` |
 | `fix_history` | Who has fixed X before? | `MATCH (p:Person)-[:RESOLVED]->(i:Incident)-[:AFFECTED]->(s:Service {name: $service}) RETURN p.name, count(DISTINCT i) ...` |
+| `similar_incidents` | Which past incidents look like this one? | `MATCH (past:Incident)-[:AFFECTED]->(s:Service {name: $service}) WHERE past.status = 'resolved' OPTIONAL MATCH (past)-[:CAUSED_BY]->(d:Deployment)-[:CHANGED]->(ds:Service) ...` |
+| `runbook` | How do I handle X? | `MATCH (r:Runbook)-[:FOR]->(s:Service {name: $service}) RETURN ...` |
+| `decision_trace` | Why is X built this way? | `MATCH (d:Decision)-[:ABOUT]->(s:Service {name: $service}) MATCH (d)-[:SOURCED_FROM]->(doc:Document) RETURN ...` |
+| `open_alerts` | Which alerts have no incident yet? | `MATCH (a:Alert)-[:FIRED_ON]->(s:Service) OPTIONAL MATCH (i:Incident)-[:TRIGGERED_BY]->(a) WITH a, s, i WHERE i IS NULL RETURN ...` |
 
 ## How the queries are verified
 
-`tests/test_graph_tools.py` loads a generated company into FalkorDB, runs each tool, and compares the result with an independent breadth-first search in plain Python (`blast_radius/seed/reference.py`) over the same data. `tests/test_generator.py` checks the data itself: no dependency cycles, every edge points at a real node, one owner per service, one on-call person per team, no future timestamps.
+`tests/test_graph_tools.py` loads a generated company into FalkorDB, runs each tool, and compares the result with an independent breadth-first search in plain Python (`blast_radius/seed/reference.py`) over the same data. `tests/test_agents.py` runs the three agents and the assistant on FalkorDB with a scripted fake LLM, so no API key is needed: it checks the agents pick the right deploy, write the handoff chain into the graph, and that memory is readable from a new connection. `tests/test_llm.py` checks provider fallback and that invented citations are rejected. `tests/test_generator.py` checks the data itself: no dependency cycles, every edge points at a real node, one owner per service, one on-call person per team, no future timestamps.
 
 ## Data
 
