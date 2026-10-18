@@ -160,7 +160,7 @@ INCIDENT_PATTERNS = [
 # Hand-written design decisions, each with a source document (Track 03).
 DECISIONS = [
     ("Separate token store for auth", "auth",
-     "Session tokens moved out of postgres-users into a dedicated Redis store to cut login latency and isolate auth from user-profile load.",
+     "Session tokens moved out of postgres-users into token-store, a dedicated Redis store, to cut login latency and isolate auth from user-profile load.",
      "ADR-007: Token storage for auth", "adr"),
     ("Payments uses its own database", "payments",
      "Payments data is kept in postgres-payments, isolated from orders, for PCI scope reduction and independent failover.",

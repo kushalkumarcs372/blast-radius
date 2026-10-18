@@ -162,26 +162,51 @@ def generate(tenant: str, now_ms: int) -> CompanyData:
         data.add_edge("ABOUT", "Decision", dec_id, "Service", svc_id(service))
         data.add_edge("SOURCED_FROM", "Decision", dec_id, "Document", doc_id)
 
-    # --- the scripted demo scenario (acme only) -------------------------------
-    if tenant == "acme":
-        _add_demo_scenario(data, add_deploy, add_incident, members, now_ms)
+    # --- one scripted live incident per company ------------------------------
+    _add_demo_scenario(data, add_deploy, add_incident, members, now_ms, DEMO_SCENARIOS[tenant])
 
     return data
 
 
-def _add_demo_scenario(data, add_deploy, add_incident, members, now_ms) -> None:
-    """2 AM alert: postgres-payments connections exhausted 40 min after a payments deploy.
+# Each company gets its own live incident: a different failing service, a different cause
+# in a neighbouring service, and a past incident with the same pattern. Same ids in every
+# tenant on purpose: the graphs are isolated, so each id resolves to that company's data.
+DEMO_SCENARIOS = {
+    "acme": dict(
+        alert_service="postgres-payments", signal="Connection pool exhausted",
+        cause_service="payments", team="payments",
+        old_change="Raise connection pool size",
+        new_change="Raise connection pool size from 50 to 400", minutes_before=40,
+    ),
+    "globex": dict(
+        alert_service="kafka", signal="Consumer lag growing",
+        cause_service="notifications", team="platform",
+        old_change="Disable consumer batching for notifications",
+        new_change="Disable consumer batching for notifications to cut latency", minutes_before=25,
+    ),
+    "initech": dict(
+        alert_service="auth", signal="Elevated 5xx error rate",
+        cause_service="token-store", team="identity",
+        old_change="Rotate token signing key",
+        new_change="Rotate token signing key without grace period", minutes_before=55,
+    ),
+}
 
-    A similar incident 3 weeks ago had the same cause and was fixed by a payments engineer.
+
+def _add_demo_scenario(data, add_deploy, add_incident, members, now_ms, sc: dict) -> None:
+    """A live alert whose likely cause is a recent deploy to a neighbouring service.
+
+    A similar incident 3 weeks ago had the same signal and the same kind of change,
+    and an engineer on the owning team fixed it.
     """
-    payments_people = members["payments"]
-    old_cause = add_deploy("deploy-demo-old", "payments", now_ms - 21 * DAY,
-                           "Raise connection pool size", author=payments_people[1])
-    add_incident("inc-demo-old", "postgres-payments", "Connection pool exhausted", "SEV2",
-                 now_ms - 21 * DAY + 50 * MINUTE, old_cause, payments_people[0])
+    people = members[sc["team"]]
+    old_cause = add_deploy("deploy-demo-old", sc["cause_service"], now_ms - 21 * DAY,
+                           sc["old_change"], author=people[1])
+    add_incident("inc-demo-old", sc["alert_service"], sc["signal"], "SEV2",
+                 now_ms - 21 * DAY + 50 * MINUTE, old_cause, people[0])
 
-    add_deploy("deploy-demo-suspect", "payments", now_ms - 40 * MINUTE,
-               "Raise connection pool size from 50 to 400", author=payments_people[2])
-    data.add_node("Alert", id="alert-demo-live", signal="Connection pool exhausted",
-                  severity="SEV1", ts=now_ms - 2 * MINUTE, service="postgres-payments")
-    data.add_edge("FIRED_ON", "Alert", "alert-demo-live", "Service", svc_id("postgres-payments"))
+    add_deploy("deploy-demo-suspect", sc["cause_service"], now_ms - sc["minutes_before"] * MINUTE,
+               sc["new_change"], author=people[2])
+    data.add_node("Alert", id="alert-demo-live", signal=sc["signal"],
+                  severity="SEV1", ts=now_ms - 2 * MINUTE, service=sc["alert_service"])
+    data.add_edge("FIRED_ON", "Alert", "alert-demo-live", "Service", svc_id(sc["alert_service"]))

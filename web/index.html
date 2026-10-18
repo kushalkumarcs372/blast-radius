@@ -263,6 +263,8 @@ async function respond(alert, btn) {
 async function showIncident(id, steps) {
   const m = await api(`/api/incidents/${id}?tenant=${state.tenant}`);
   state.incident = id;
+  state.alerting = (m.triage || {}).service;
+  state.cause = ((m.investigator || {}).likely_cause || {}).service;
   const tri = m.triage || {}, inv = m.investigator || {}, resp = m.responder || {};
   $("incident-sec").hidden = false; $("actions-sec").hidden = false;
   $("inc-id").textContent = id;
@@ -289,8 +291,10 @@ async function showIncident(id, steps) {
 
 // ---------- ask ----------
 function renderSuggestions() {
+  // Suggestions follow the open incident, so each company gets questions about its own outage.
+  const c = state.cause || "payments", a = state.alerting || "postgres-payments";
   const qs = state.incident
-    ? ["What caused this and who fixed it last time?", "Why does payments have its own database?", "What else depends on payments?"]
+    ? ["What caused this and who fixed it last time?", `Who owns ${c} and who is on call?`, `What else depends on ${a}?`]
     : ["Which services are most critical?", "Who owns checkout and who is on call?", "How is mobile-bff connected to token-store?"];
   $("suggest").innerHTML = qs.map((q) => `<button class="chip" style="cursor:pointer">${esc(q)}</button>`).join("");
   $("suggest").querySelectorAll("button").forEach((b) => b.onclick = () => { $("q").value = b.textContent; ask(); });
@@ -311,7 +315,7 @@ async function ask() {
 
 // ---------- boot ----------
 async function switchTenant(t) {
-  state.tenant = t; state.incident = null;
+  state.tenant = t; state.incident = null; state.alerting = null; state.cause = null;
   $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("answer").innerHTML = "";
   await loadGraph(); await loadAlerts(); await loadIncidents(); renderSuggestions();
   // A visitor arriving after the alert was handled sees the latest incident instead of an empty map.

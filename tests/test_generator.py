@@ -67,15 +67,23 @@ def test_no_timestamps_in_the_future():
             assert n.get("resolved", 0) <= NOW
 
 
-def test_demo_scenario_is_present_in_acme_only():
-    acme = generate("acme", NOW)
-    suspect = next(d for d in acme.nodes["Deployment"] if d["id"] == "deploy-demo-suspect")
-    assert suspect["service"] == "payments" and suspect["ts"] == NOW - 40 * MINUTE
-    assert "postgres-payments" in reference.dependencies(acme, "payments", 1)
-    # It must be the only deploy in the payments neighbourhood in the last 6 hours.
-    assert reference.recent_deploys(acme, "postgres-payments", NOW - 6 * 60 * MINUTE) == {"deploy-demo-suspect"}
-    for tenant in ("globex", "initech"):
-        assert not any(d["id"].startswith("deploy-demo") for d in generate(tenant, NOW).nodes["Deployment"])
+def test_every_company_has_its_own_live_incident():
+    from blast_radius.seed.generator import DEMO_SCENARIOS
+
+    services = set()
+    for tenant, sc in DEMO_SCENARIOS.items():
+        data = generate(tenant, NOW)
+        suspect = next(d for d in data.nodes["Deployment"] if d["id"] == "deploy-demo-suspect")
+        assert suspect["service"] == sc["cause_service"]
+        assert suspect["ts"] == NOW - sc["minutes_before"] * MINUTE
+        # The cause sits next to the alerting service...
+        assert sc["cause_service"] in reference.neighbourhood(data, sc["alert_service"], 1)
+        # ...and is the only change near it in the 6 hours before the alert.
+        alert_ts = NOW - 2 * MINUTE
+        assert reference.recent_deploys(data, sc["alert_service"], alert_ts - 6 * 60 * MINUTE) == {"deploy-demo-suspect"}
+        assert reference.owning_team(data, sc["cause_service"]) == sc["team"]
+        services.add(sc["alert_service"])
+    assert len(services) == len(DEMO_SCENARIOS)  # a different failing service per company
 
 
 def test_postgres_payments_outage_reaches_the_edge():

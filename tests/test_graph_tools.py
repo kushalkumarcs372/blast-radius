@@ -140,9 +140,10 @@ def test_tenants_are_isolated(db, g, acme):
     acme_people = {r[0] for r in g.query("MATCH (p:Person) RETURN p.name").result_set}
     globex_people = {r[0] for r in other.query("MATCH (p:Person) RETURN p.name").result_set}
     assert acme_people != globex_people
-    # The demo deploy exists only in acme's graph.
-    assert other.query("MATCH (d:Deployment {id: 'deploy-demo-suspect'}) RETURN count(d)").result_set[0][0] == 0
-    assert g.query("MATCH (d:Deployment {id: 'deploy-demo-suspect'}) RETURN count(d)").result_set[0][0] == 1
+    # The same id resolves to each company's own data: payments in acme, notifications in globex.
+    q = "MATCH (d:Deployment {id: 'deploy-demo-suspect'})-[:CHANGED]->(s:Service) RETURN s.name"
+    assert g.query(q).result_set == [["payments"]]
+    assert other.query(q).result_set == [["notifications"]]
 
 
 def test_decision_trace_finds_decisions_attached_or_mentioning(g):
