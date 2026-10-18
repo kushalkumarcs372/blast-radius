@@ -77,6 +77,10 @@
   .stat.hot b { color: var(--accent); }
   .ask-row { display: flex; gap: 8px; }
   .ask-row input { flex: 1; min-width: 0; }
+  textarea { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px; width: 100%; min-height: 76px; resize: vertical; }
+  .facts { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .facts b { color: var(--text); font-weight: 500; }
   .answer { margin-top: 10px; }
   .tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { font: 12px "IBM Plex Mono", monospace; border: 1px solid var(--line); border-radius: 999px;
@@ -113,6 +117,17 @@
     </div>
   </div>
   <aside>
+    <section>
+      <h2>Describe an incident</h2>
+      <div class="card">
+        <textarea id="report" maxlength="1500" placeholder="Write what you see, in your own words. The agents map it onto this company's graph and investigate."></textarea>
+        <div class="row" style="margin-top:8px;justify-content:space-between">
+          <div class="row" id="report-examples"></div>
+          <button class="primary" id="report-go">Investigate</button>
+        </div>
+        <div id="report-out"></div>
+      </div>
+    </section>
     <section>
       <h2>Open alerts</h2>
       <div id="alerts" class="card"><div class="empty">Loading…</div></div>
@@ -260,6 +275,35 @@ async function respond(alert, btn) {
   } catch (e) { status("Error: " + e.message); btn.disabled = false; }
   setTimeout(() => status(""), 2500);
 }
+// ---------- free-text incident reports ----------
+const EXAMPLES = {
+  acme: "Checkout is throwing 500 errors for the last 15 minutes. We pushed a pricing rules change about 25 minutes ago.",
+  globex: "Search results are timing out since 10 minutes. Someone changed the recommendations model config 20 minutes back.",
+  initech: "Customers can't log in, the login page spins forever. It started 5 minutes ago, right after a users service deploy.",
+};
+function renderExamples() {
+  $("report-examples").innerHTML = `<button class="chip" style="cursor:pointer">Use an example</button>`;
+  $("report-examples").querySelector("button").onclick = () => { $("report").value = EXAMPLES[state.tenant] || EXAMPLES.acme; };
+}
+async function investigateReport() {
+  const text = $("report").value.trim(); if (!text) return;
+  const btn = $("report-go"); btn.disabled = true;
+  $("report-out").innerHTML = `<div class="facts">Reading the report and mapping it onto the graph…</div>`;
+  status("Understanding report → Triage → Investigator → Responder…");
+  try {
+    const out = await api("/api/report", { method: "POST", body: JSON.stringify({ text, tenant: state.tenant }) });
+    const f = out.facts;
+    $("report-out").innerHTML = `<div class="facts">Understood by <b>${esc(f.parsed_by)}</b>:
+      <b>${esc(f.signal)}</b> on <b class="mono">${esc(f.service)}</b> · ${esc(f.severity)} · started ${f.minutes_ago} min ago
+      ${f.changes.map((c) => `<br>reported change: <b>${esc(c.summary)}</b> on <span class="mono">${esc(c.service)}</span>, ${c.minutes_ago} min ago`).join("")}
+      ${f.dropped_changes.length ? `<br>ignored (no matching service): ${esc(f.dropped_changes.join("; "))}` : ""}</div>`;
+    status(`Done in ${(out.total_ms / 1000).toFixed(1)} s`);
+    await showIncident(out.incident, out.steps);
+    await loadIncidents();
+  } catch (e) { $("report-out").innerHTML = `<div class="warn">${esc(e.message)}</div>`; status(""); }
+  btn.disabled = false; setTimeout(() => status(""), 2500);
+}
+
 async function showIncident(id, steps) {
   const m = await api(`/api/incidents/${id}?tenant=${state.tenant}`);
   state.incident = id;
@@ -316,6 +360,7 @@ async function ask() {
 // ---------- boot ----------
 async function switchTenant(t) {
   state.tenant = t; state.incident = null; state.alerting = null; state.cause = null;
+  $("report-out").innerHTML = ""; renderExamples();
   $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("answer").innerHTML = "";
   await loadGraph(); await loadAlerts(); await loadIncidents(); renderSuggestions();
   // A visitor arriving after the alert was handled sees the latest incident instead of an empty map.
@@ -324,6 +369,7 @@ async function switchTenant(t) {
 }
 $("tenant").onchange = (e) => switchTenant(e.target.value);
 $("ask").onclick = ask;
+$("report-go").onclick = investigateReport;
 $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
 $("reset").onclick = async () => {
   $("reset").disabled = true; status("Reloading synthetic companies…");

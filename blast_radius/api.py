@@ -105,6 +105,31 @@ def respond(body: RespondIn):
                       for s in out["steps"]]}
 
 
+class ReportIn(BaseModel):
+    text: str
+    tenant: str = "acme"
+
+
+@app.post("/api/report")
+def report(body: ReportIn, request: Request):
+    """Free-text incident report -> facts in the graph -> the three agents investigate."""
+    from .agents.orchestrator import handle_alert
+    from .intake import ReportError, parse_report, record_report
+
+    if _rate_limited(request.client.host if request.client else "unknown"):
+        raise HTTPException(429, "Report limit reached for this hour; the demo runs on free LLM tiers.")
+    g = _graph(body.tenant)
+    try:
+        facts = parse_report(g, body.text, _llm)
+    except ReportError as exc:
+        raise HTTPException(422, str(exc))
+    alert = record_report(g, facts, body.text)
+    out = handle_alert(g, alert, llm=_llm)
+    return {"incident": out["incident"], "session": out["session"], "total_ms": out["total_ms"], "facts": facts,
+            "steps": [{k: s[k] for k in ("agent", "episode", "summary", "summary_source", "ms", "cypher")}
+                      for s in out["steps"]]}
+
+
 @app.get("/api/incidents")
 def incidents(tenant: str = "acme"):
     return memory.list_incidents(_graph(tenant))

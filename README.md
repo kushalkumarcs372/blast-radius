@@ -39,6 +39,10 @@ uvicorn blast_radius.api:app --reload
 
 Open http://localhost:8000. Click **Run agents** on the open alert: the map dims everything except the services at risk (orange), the alerting service (red) and the link to the suspect deploy (blue dashed). The right panel shows each agent's summary with the graph nodes it cites, the Cypher it ran, the proposed actions, and an **Ask the graph** box. Click any service on the map to preview its blast radius.
 
+### Describe an incident in your own words
+
+The **Describe an incident** box (or `python -m blast_radius.cli report "..."`) takes any free-text report, for example *"Checkout is throwing 500 errors for the last 15 minutes. We pushed a pricing rules change about 25 minutes ago."* The LLM maps it onto the company's graph: the failing service, the symptom (reusing a known signal when one fits), the severity, and any changes mentioned. Every service it names is checked against the graph, so it cannot invent one; anything that does not match is shown as ignored. The facts are written to FalkorDB as an `Alert` (and `Deployment` nodes for reported changes), and the three agents investigate it like any other alert. Without an LLM key, a keyword fallback finds service names in the text.
+
 ### MCP server
 
 The same graph tools are exposed over the Model Context Protocol, so any MCP client can drive them. For Claude Desktop, add to `claude_desktop_config.json` (adjust the paths):

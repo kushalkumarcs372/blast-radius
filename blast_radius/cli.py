@@ -9,6 +9,7 @@
   python -m blast_radius.cli memory INC      show everything agents recorded on an incident
   python -m blast_radius.cli ask "QUESTION" [--session S] [--incident INC]
   python -m blast_radius.cli llm-check       test the Gemini and Groq keys
+  python -m blast_radius.cli report "TEXT"   describe an incident in your own words; agents investigate it
 
 Add --tenant NAME to any command (default: acme).
 """
@@ -128,6 +129,25 @@ def ask_cmd(tenant: str, argv: list[str]) -> None:
         print(f"\n(warning: cited ids not found in tool results: {out['invented_ids']})")
 
 
+def report_cmd(tenant: str, text: str) -> None:
+    from .intake import ReportError, parse_report, record_report
+    from .llm import from_env
+
+    g = graph(tenant)
+    try:
+        facts = parse_report(g, text, from_env())
+    except ReportError as exc:
+        print(exc)
+        return
+    print(f"Understood ({facts['parsed_by']}): {facts['signal']} on {facts['service']} "
+          f"({facts['severity']}, {facts['minutes_ago']} min ago)")
+    for c in facts["changes"]:
+        print(f"  reported change: {c['summary']} on {c['service']}, {c['minutes_ago']} min ago")
+    for d in facts["dropped_changes"]:
+        print(f"  ignored (no matching service): {d}")
+    respond(tenant, record_report(g, facts, text))
+
+
 def llm_check() -> None:
     from .llm import LLM, from_env
 
@@ -164,6 +184,8 @@ def main(argv: list[str]) -> None:
         show_memory(tenant, argv[1])
     elif cmd == "ask" and len(argv) >= 2:
         ask_cmd(tenant, argv[1:])
+    elif cmd == "report" and len(argv) >= 2:
+        report_cmd(tenant, " ".join(argv[1:]))
     elif cmd == "llm-check":
         llm_check()
     else:
