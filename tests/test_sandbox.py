@@ -143,3 +143,30 @@ def test_gateway_called_by_apps_is_not_customer_facing():
     tiers = {s["name"]: s["tier"] for s in data.nodes["Service"]}
     assert tiers["mobile-app"] == tiers["web-app"] == "edge"
     assert tiers["api-gateway"] == "platform"
+
+
+def test_repair_pass_adds_services_the_model_left_out():
+    from blast_radius.ingest import extract, missed_names
+
+    text = ("MediQueue: patients use patient-app and doctors use doctor-portal; both call api-edge. "
+            "api-edge calls video-bridge, which depends on turn-relay.")
+    first = {"services": [{"name": "api-edge"}, {"name": "video-bridge"}, {"name": "turn-relay"}],
+             "dependencies": [{"from": "api-edge", "to": "video-bridge"}, {"from": "video-bridge", "to": "turn-relay"}]}
+    assert missed_names(text, first) == ["doctor-portal", "patient-app"]
+    fixed = {"services": first["services"] + [{"name": "patient-app", "tier": "edge"}, {"name": "doctor-portal", "tier": "edge"}],
+             "dependencies": first["dependencies"] + [{"from": "patient-app", "to": "api-edge"},
+                                                      {"from": "doctor-portal", "to": "api-edge"}]}
+    fake = Scripted([first, fixed])
+    raw = extract(text, LLM([fake]))
+    assert {s["name"] for s in raw["services"]} >= {"patient-app", "doctor-portal"}
+    assert fake.replies == []  # the repair call was made
+
+
+def test_past_incident_without_a_signal_is_kept():
+    raw = {"services": [{"name": "video-bridge"}, {"name": "turn-relay"}],
+           "dependencies": [{"from": "video-bridge", "to": "turn-relay"}],
+           "past_incidents": [{"id": "inc-video-042", "service": "video-bridge", "signal": None,
+                               "cause_service": "turn-relay", "cause_summary": "shortened the allocation timeout",
+                               "days_ago": 21}]}
+    data, summary = build_company(raw, NOW)
+    assert summary["past_incidents"] == 1 and [i["id"] for i in data.nodes["Incident"]] == ["inc-video-042"]

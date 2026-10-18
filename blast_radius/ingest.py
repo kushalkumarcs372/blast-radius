@@ -22,6 +22,9 @@ SYSTEM = (
     "Use ONLY what the text states; never invent services, people, deploys or incidents. "
     "Service names: short lowercase-with-hyphens (\"Payments API\" -> payments-api). "
     "A dependency {from, to} means FROM calls or needs TO. tier is one of edge (user-facing), core, data, platform, external. "
+    "List EVERY named service, including user-facing apps and portals (tier edge), databases, caches, queues and "
+    "adapters; \"A and B both call C\" gives two dependencies. Every past incident needs a signal: the symptom in a "
+    "few words, e.g. \"Calls dropping\". "
     "Reply with one JSON object exactly in this shape (use [] or null when the text has nothing):\n"
     '{"company": "<name or null>",\n'
     ' "services": [{"name": "...", "tier": "..."}],\n'
@@ -158,7 +161,9 @@ def build_company(raw: dict, now_ms: int) -> tuple[CompanyData, dict]:
         if not isinstance(inc, dict):
             continue
         s = add_service(inc.get("service"))
-        signal = str(inc.get("signal") or "").strip()[:80]
+        # Models sometimes leave the symptom empty; the description or the cause still says what happened.
+        signal = str(inc.get("signal") or inc.get("description") or inc.get("summary")
+                     or (f"Failure after {inc['cause_summary']}" if inc.get("cause_summary") else "")).strip()[:80]
         if not (s and signal):
             dropped.append(f"past incident {signal or inc}")
             continue
@@ -225,8 +230,30 @@ def extract(text: str, llm) -> dict:
         raise IngestError(f"The language model is unavailable right now: {exc}") from None
     if not isinstance(raw, dict):
         raise IngestError("The model did not return a JSON object.")
-    raw["_parsed_by"] = llm.last_provider
+    parsed_by = llm.last_provider
+    missing = missed_names(text, raw)
+    if missing:
+        # One repair pass: name what was left out and ask for the corrected object.
+        try:
+            fixed = llm.complete_json(SYSTEM, f"DESCRIPTION:\n{text}\n\nYOUR PREVIOUS ANSWER:\n{json.dumps(raw)}\n\n"
+                                      f"These names from the description are missing from it: {', '.join(missing)}. "
+                                      "If any of them are services, add them with their dependencies. Return the "
+                                      "complete corrected JSON object.")
+            if isinstance(fixed, dict) and len(fixed.get("services") or []) >= len(raw.get("services") or []):
+                raw, parsed_by = fixed, llm.last_provider
+        except Exception:
+            pass  # keep the first extraction
+    raw["_parsed_by"] = parsed_by
     return raw
+
+
+_HYPHENATED = re.compile(r"(?<![\w-])([a-z][a-z]*(?:-[a-z]+)+)(?![\w-])")
+
+
+def missed_names(text: str, raw: dict) -> list[str]:
+    """Hyphenated names in the text (patient-app, turn-relay) that appear nowhere in the extraction."""
+    found = json.dumps(raw).lower()
+    return sorted({n for n in _HYPHENATED.findall(text) if n not in found})[:20]
 
 
 def build_from_text(g, text: str, llm, now_ms: int | None = None) -> dict:
