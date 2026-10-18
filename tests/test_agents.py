@@ -229,3 +229,12 @@ def test_ask_must_call_a_tool_and_flags_names_not_in_the_graph(run):
     assert "pushed" not in out["answer"] and "without calling any tool" in llm.providers[0].prompts[1]
     assert out["unknown_names"] == ["adr-42", "svc-ledger-legacy"]  # deploy-demo-suspect is real; customer-facing is a word
     assert "not found in the graph" in out["answer"]
+
+
+def test_responder_summary_may_cite_the_past_incident_it_names(run):
+    from blast_radius.agents.base import known_ids
+    _, out = run
+    f = out["steps"][2]["findings"]
+    named = [a for a in f["actions"] if "resolved inc-" in a]
+    if named:  # the expert line names a past incident: its id must be citable
+        assert "inc-demo-old" in known_ids(f)

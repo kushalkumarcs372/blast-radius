@@ -55,6 +55,8 @@ def run(g, incident: str, session: str, llm=None) -> dict:
         why = f"resolved {past[0]['incident']} with the same signal" if past else f"has fixed {expert['fixes']} incident(s) here"
         actions.append(f"Loop in {expert['person']}, who {why}.")
         cites.append(("Person", expert["id"]))
+        if past:
+            cites.append(("Incident", past[0]["incident"]))  # named in the action, so the summary may cite it
     elif expert:
         actions.append(f"{expert['person']} is on call and has fixed this before.")
     for b in books.results:
