@@ -7,7 +7,6 @@ Built for **Graph Hacks 2026** (WeMakeDevs × FalkorDB).
 | | |
 | --- | --- |
 | **Live demo** | https://blast-radius-duqf.onrender.com (free tier: the first load after idle can take about a minute) |
-| **Demo video** | _link added at submission_ |
 | **Tracks** | 01 Agents That Act on Connected Data (primary) · 02 Agent Memory and Coordination · 03 Company Brain |
 | **Stack** | FalkorDB Cloud · Python 3.12 · FastAPI · Groq `openai/gpt-oss-120b` (Gemini fallback) · Cytoscape.js · MCP · Render |
 
