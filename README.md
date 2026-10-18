@@ -4,7 +4,7 @@
 
 Built for **Graph Hacks 2026** (WeMakeDevs × FalkorDB).
 
-
+| | |
 | --- | --- |
 | **Live demo** | https://blast-radius-duqf.onrender.com (free tier: the first load after idle can take about a minute) |
 | **Tracks** | 01 Agents That Act on Connected Data (primary) · 02 Agent Memory and Coordination · 03 Company Brain |
