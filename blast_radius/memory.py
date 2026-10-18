@@ -127,32 +127,116 @@ def incident_memory(g, incident: str) -> dict:
         "OPTIONAL MATCH (e)-[:HANDED_OFF_TO]->(nx:Agent) "
         "OPTIONAL MATCH (e)-[:CITES]->(c) "
         "RETURN e.id, ag.name, e.kind, e.session, e.ts AS ts, e.summary, e.confidence, nx.name, "
-        "collect(DISTINCT c.id) ORDER BY ts",
+        "collect(DISTINCT c.id), e.findings ORDER BY ts",
         {"inc": incident},
     ).result_set
     episodes = [
         {"episode": e, "agent": a, "kind": k, "session": s, "ts": ts, "summary": summ,
-         "confidence": conf, "handed_off_to": nx, "cites": sorted(c for c in cites if c)}
-        for e, a, k, s, ts, summ, conf, nx, cites in rows
+         "confidence": conf, "handed_off_to": nx, "cites": sorted(c for c in cites if c),
+         "summary_source": json.loads(f or "{}").get("summary_source")}
+        for e, a, k, s, ts, summ, conf, nx, cites, f in rows
     ]
     suspects = g.query(
         "MATCH (:Incident {id: $inc})-[r:SUSPECTED_CAUSE]->(d:Deployment)-[:CHANGED]->(s:Service) "
         "RETURN d.id, d.summary, s.name, r.confidence AS conf ORDER BY conf DESC",
         {"inc": incident},
     ).result_set
+    docs = g.query("MATCH (d:Document)-[:MENTIONS]->(:Incident {id: $inc}) RETURN d.id, d.title, d.type",
+                   {"inc": incident}).result_set
+    # Facts recorded on the incident itself: who fixed it, what caused it, what it hit.
+    # Past incidents (seeded or built from text) have these but no agent episodes.
+    fixers = [r[0] for r in g.query(
+        "MATCH (p:Person)-[:RESOLVED]->(:Incident {id: $inc}) RETURN p.name", {"inc": incident}).result_set]
+    causes = [{"deployment": d, "summary": su, "service": s} for d, su, s in g.query(
+        "MATCH (:Incident {id: $inc})-[:CAUSED_BY]->(d:Deployment) OPTIONAL MATCH (d)-[:CHANGED]->(s:Service) "
+        "RETURN d.id, d.summary, s.name", {"inc": incident}).result_set]
+    affected = [r[0] for r in g.query(
+        "MATCH (:Incident {id: $inc})-[:AFFECTED]->(s:Service) RETURN s.name", {"inc": incident}).result_set]
     return {
         "incident": incident, "title": title, "status": status, "severity": sev, "service": service,
-        "started": started, "episodes": episodes,
+        "started": started, "resolved_by": fixers, "caused_by": causes, "affected_services": affected,
+        "episodes": episodes,
+        "documents": [{"document": d, "title": t, "type": ty} for d, t, ty in docs],
         "suspected_causes": [{"deployment": d, "summary": su, "service": s, "confidence": c}
                              for d, su, s, c in suspects],
     }
 
 
 def list_incidents(g, status: str | None = None) -> list[dict]:
-    q = ("MATCH (i:Incident) WHERE i.status <> 'resolved' "
-         "OPTIONAL MATCH (e:Episode)-[:ABOUT]->(i) "
-         "RETURN i.id, i.title, i.status, i.started AS started, count(e) ORDER BY started DESC")
+    """Incidents the agents have worked on, plus any still open. Newest first."""
+    q = ("MATCH (i:Incident) OPTIONAL MATCH (e:Episode)-[:ABOUT]->(i) "
+         "WITH i, count(e) AS n WHERE i.status <> 'resolved' OR n > 0 "
+         "RETURN i.id, i.title, i.status, i.started AS started, n ORDER BY started DESC")
     if status == "all":
-        q = q.replace("WHERE i.status <> 'resolved' ", "")
+        q = ("MATCH (i:Incident) OPTIONAL MATCH (e:Episode)-[:ABOUT]->(i) "
+             "RETURN i.id, i.title, i.status, i.started AS started, count(e) ORDER BY started DESC")
     return [{"incident": i, "title": t, "status": s, "started": st, "episodes": n}
             for i, t, s, st, n in g.query(q).result_set]
+
+
+def resolve_incident(g, incident: str, session: str, cause_deployment: str | None = None,
+                     resolved_by: str | None = None) -> dict:
+    """Close the loop: write what fixed the incident back into the graph.
+
+    The confirmed cause becomes CAUSED_BY, the person who fixed it gets a RESOLVED edge,
+    a postmortem Document is linked, and the Responder records a resolution Episode.
+    After this, similar_incidents and fix_history find this incident like any past one,
+    so the next alert of this kind is investigated with this experience (procedural memory).
+    """
+    head = g.query("MATCH (i:Incident {id: $i}) RETURN i.title, i.status, i.service", {"i": incident}).result_set
+    if not head:
+        raise ValueError(f"unknown incident: {incident}")
+    title, status, service = head[0]
+    if status == "resolved":
+        raise ValueError(f"{incident} is already resolved")
+    if cause_deployment is None:  # default: the Investigator's top suspect
+        rows = g.query("MATCH (:Incident {id: $i})-[r:SUSPECTED_CAUSE]->(d:Deployment) "
+                       "RETURN d.id, r.confidence AS c ORDER BY c DESC LIMIT 1", {"i": incident}).result_set
+        cause_deployment = rows[0][0] if rows else None
+    if resolved_by is None:  # default: who the Responder paged
+        ep = latest_episode(g, incident, "responder")
+        name = (ep or {}).get("findings", {}).get("on_call")
+        rows = g.query("MATCH (p:Person {name: $n}) RETURN p.id LIMIT 1", {"n": name}).result_set if name else []
+        resolved_by = rows[0][0] if rows else None
+
+    ts = now_ms()
+    g.query("MATCH (i:Incident {id: $i}) SET i.status = 'resolved', i.resolved = $ts", {"i": incident, "ts": ts})
+    cites: list[tuple[str, str]] = [("Incident", incident)]
+    if cause_deployment:
+        g.query("MATCH (i:Incident {id: $i}), (d:Deployment {id: $d}) MERGE (i)-[:CAUSED_BY]->(d)",
+                {"i": incident, "d": cause_deployment})
+        cites.append(("Deployment", cause_deployment))
+    if resolved_by:
+        g.query("MATCH (p:Person {id: $p}), (i:Incident {id: $i}) MERGE (p)-[:RESOLVED]->(i)",
+                {"p": resolved_by, "i": incident})
+        cites.append(("Person", resolved_by))
+    doc_id = f"doc-pm-{incident}"
+    g.query("MATCH (i:Incident {id: $i}) MERGE (d:Document {id: $d}) "
+            "SET d.title = $t, d.type = 'postmortem', d.source = 'blast-radius' MERGE (d)-[:MENTIONS]->(i)",
+            {"i": incident, "d": doc_id, "t": f"Postmortem: {title}"})
+    cites.append(("Document", doc_id))
+    fixer = g.query("MATCH (p:Person {id: $p}) RETURN p.name", {"p": resolved_by}).result_set if resolved_by else []
+    summary_text = (f"Resolved [{incident}]. Confirmed cause: "
+                    f"{('[' + cause_deployment + ']') if cause_deployment else 'not confirmed'}; "
+                    f"fixed by {fixer[0][0] if fixer else 'unknown'}. Postmortem [{doc_id}] linked. "
+                    f"Future alerts on {service} will be compared with this incident.")
+    record_episode(g, agent="responder", incident=incident, session=session, kind="resolution",
+                   summary=summary_text,
+                   findings={"cause_deployment": cause_deployment, "resolved_by": resolved_by, "postmortem": doc_id},
+                   cites=cites)
+    return {"incident": incident, "status": "resolved", "cause_deployment": cause_deployment,
+            "resolved_by": resolved_by, "postmortem": doc_id, "summary": summary_text}
+
+
+def refire_alert(g, incident: str) -> str:
+    """Fire a new alert with the same signal on the same service, to see what the agents learned."""
+    rows = g.query("MATCH (:Incident {id: $i})-[:TRIGGERED_BY]->(a:Alert)-[:FIRED_ON]->(s:Service) "
+                   "RETURN a.signal, a.severity, s.name", {"i": incident}).result_set
+    if not rows:
+        raise ValueError(f"unknown incident: {incident}")
+    signal, severity, service = rows[0]
+    alert_id = f"alert-again-{uuid.uuid4().hex[:8]}"
+    g.query("MATCH (s:Service {name: $svc}) "
+            "CREATE (:Alert {id: $id, signal: $sig, severity: $sev, ts: $ts, service: $svc})-[:FIRED_ON]->(s)",
+            {"svc": service, "id": alert_id, "sig": signal, "sev": severity, "ts": now_ms()})
+    return alert_id

@@ -25,8 +25,18 @@ SYSTEM = (
     '{"service": "<failing service from SERVICES>", "signal": "<symptom>", "severity": "SEV1|SEV2|SEV3", '
     '"minutes_ago": <when it started, default 5>, '
     '"changes": [{"service": "<service from SERVICES>", "summary": "<what changed>", "minutes_ago": <int>}]} '
-    'If no service in SERVICES matches, reply {"error": "<short reason>"}.'
+    'If no service in SERVICES matches, reply {"error": "<short reason>"}. '
+    'If the text is a question rather than a report of something going wrong, reply {"error": "question"}.'
 )
+
+QUESTION_START = ("what", "who", "why", "how", "which", "when", "where", "is ", "are ", "can ", "does ", "do ",
+                  "should ", "tell me", "show me", "list ", "explain", "trace", "find ", "give me", "count ",
+                  "compare", "describe the", "summarize", "summarise")
+
+
+def looks_like_question(text: str) -> bool:
+    t = text.strip().lower()
+    return t.endswith("?") or t.startswith(QUESTION_START)
 
 
 class ReportError(ValueError):

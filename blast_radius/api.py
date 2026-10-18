@@ -3,6 +3,7 @@
 Run:  uvicorn blast_radius.api:app --reload      then open http://localhost:8000
 """
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
@@ -34,6 +35,13 @@ _llm = from_env()
 _ask_log: dict[str, deque] = defaultdict(deque)
 
 
+def _empty_sandbox(tenant: str) -> bool:
+    """The sandbox company exists only after something has been built in it."""
+    from .ingest import SANDBOX
+
+    return tenant == SANDBOX and SANDBOX not in list_tenants()
+
+
 def _graph(tenant: str):
     if tenant not in list_tenants():
         raise HTTPException(404, f"unknown tenant {tenant!r}")
@@ -63,15 +71,20 @@ def health():
 
 @app.get("/api/tenants")
 def tenants():
-    return list_tenants()
+    from .ingest import SANDBOX
+
+    return [t for t in list_tenants() if t != SANDBOX] + [SANDBOX]
 
 
 @app.get("/api/graph")
 def service_graph(tenant: str = "acme"):
     """Services, owners and dependencies, for drawing the map."""
+    if _empty_sandbox(tenant):
+        return {"nodes": [], "edges": []}
     g = _graph(tenant)
     nodes = g.query(
-        "MATCH (t:Team)-[:OWNS]->(s:Service) RETURN s.name, s.tier, s.language, t.name ORDER BY s.name"
+        "MATCH (s:Service) OPTIONAL MATCH (t:Team)-[:OWNS]->(s) "
+        "RETURN s.name AS name, s.tier, s.language, t.name ORDER BY name"
     ).result_set
     edges = g.query("MATCH (a:Service)-[:DEPENDS_ON]->(b:Service) RETURN a.name, b.name").result_set
     crit = {r["service"]: r["pagerank"] for r in T.critical_services(g, 50).results}
@@ -83,6 +96,8 @@ def service_graph(tenant: str = "acme"):
 
 @app.get("/api/alerts")
 def alerts(tenant: str = "acme"):
+    if _empty_sandbox(tenant):
+        return []
     return T.open_alerts(_graph(tenant)).results
 
 
@@ -108,6 +123,8 @@ def respond(body: RespondIn):
 class ReportIn(BaseModel):
     text: str
     tenant: str = "acme"
+    session: str = "web"
+    incident: str | None = None
 
 
 @app.post("/api/report")
@@ -122,6 +139,12 @@ def report(body: ReportIn, request: Request):
     try:
         facts = parse_report(g, body.text, _llm)
     except ReportError as exc:
+        # A question typed into the report box goes to the assistant instead of failing.
+        from .agents.ask import ask as run_ask
+        from .intake import looks_like_question
+
+        if looks_like_question(body.text) or "question" in str(exc).lower():
+            return {"routed": "ask", **run_ask(g, body.text, _llm, body.session, body.incident)}
         raise HTTPException(422, str(exc))
     alert = record_report(g, facts, body.text)
     out = handle_alert(g, alert, llm=_llm)
@@ -132,7 +155,45 @@ def report(body: ReportIn, request: Request):
 
 @app.get("/api/incidents")
 def incidents(tenant: str = "acme"):
+    if _empty_sandbox(tenant):
+        return []
     return memory.list_incidents(_graph(tenant))
+
+
+class BuildIn(BaseModel):
+    text: str
+
+
+@app.post("/api/sandbox/build")
+def sandbox_build(body: BuildIn, request: Request):
+    """Wipe the sandbox company and build a new graph from a plain-English description."""
+    from .db import graph as get_graph
+    from .ingest import SANDBOX, IngestError, build_from_text
+
+    if _rate_limited(request.client.host if request.client else "unknown"):
+        raise HTTPException(429, "Limit reached for this hour; the demo runs on free LLM tiers.")
+    try:
+        return build_from_text(get_graph(SANDBOX), body.text, _llm)
+    except IngestError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.post("/api/sandbox/clear")
+def sandbox_clear():
+    """Delete the sandbox graph entirely: the map goes blank, 0 nodes and 0 edges."""
+    from .db import graph as get_graph
+    from .ingest import SANDBOX
+
+    if not _empty_sandbox(SANDBOX):
+        get_graph(SANDBOX).delete()
+    return {"ok": True, "tenant": SANDBOX, "nodes": 0, "edges": 0}
+
+
+@app.get("/api/sandbox/example")
+def sandbox_example():
+    from .ingest import EXAMPLE
+
+    return {"text": EXAMPLE}
 
 
 @app.get("/api/incidents/{incident}")
@@ -145,7 +206,55 @@ def incident(incident: str, tenant: str = "acme"):
     for agent in ("triage", "investigator", "responder"):
         ep = memory.latest_episode(g, incident, agent)
         mem[agent] = ep["findings"] if ep else None
+    _ground(g, mem["episodes"])
     return mem
+
+
+_ID = re.compile(r"\[([a-z0-9][a-z0-9\-]+)\]")
+
+
+def _ground(g, episodes: list[dict]) -> None:
+    """For each episode: how many node ids its summary cites, and how many exist in FalkorDB."""
+    ids = sorted({i for e in episodes for i in _ID.findall(e["summary"] or "")})
+    found: set[str] = set()
+    if ids:  # a citation may be a node id or a service name
+        found = {r[0] for r in g.query("MATCH (n) WHERE n.id IN $ids RETURN n.id", {"ids": ids}).result_set}
+        found |= {r[0] for r in g.query("MATCH (s:Service) WHERE s.name IN $ids RETURN s.name", {"ids": ids}).result_set}
+    for e in episodes:
+        cited = sorted(set(_ID.findall(e["summary"] or "")))
+        e["grounding"] = {"cited": len(cited), "verified": sum(c in found for c in cited),
+                          "unverified": [c for c in cited if c not in found],
+                          "evidence_nodes": len(e["cites"])}
+
+
+class TenantIn(BaseModel):
+    tenant: str = "acme"
+    session: str = "web"
+
+
+@app.post("/api/incidents/{incident}/resolve")
+def resolve(incident: str, body: TenantIn):
+    """Confirm the cause and close the incident; the graph remembers it for next time."""
+    try:
+        return memory.resolve_incident(_graph(body.tenant), incident, body.session)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.post("/api/incidents/{incident}/refire")
+def refire(incident: str, body: TenantIn):
+    """Fire a new alert like this incident's and run the agents, to show what they learned."""
+    from .agents.orchestrator import handle_alert
+
+    g = _graph(body.tenant)
+    try:
+        alert = memory.refire_alert(g, incident)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    out = handle_alert(g, alert, llm=_llm)
+    return {"incident": out["incident"], "session": out["session"], "total_ms": out["total_ms"],
+            "steps": [{k: s[k] for k in ("agent", "episode", "summary", "summary_source", "ms", "cypher")}
+                      for s in out["steps"]]}
 
 
 class AskIn(BaseModel):
@@ -159,8 +268,8 @@ class AskIn(BaseModel):
 def ask(body: AskIn, request: Request):
     from .agents.ask import ask as run_ask
 
-    if not body.question.strip() or len(body.question) > 500:
-        raise HTTPException(400, "question must be 1-500 characters")
+    if not body.question.strip() or len(body.question) > 1500:
+        raise HTTPException(400, "question must be 1-1500 characters")
     if _rate_limited(request.client.host if request.client else "unknown"):
         raise HTTPException(429, "Question limit reached for this hour; the demo runs on free LLM tiers.")
     return run_ask(_graph(body.tenant), body.question, _llm, body.session, body.incident)

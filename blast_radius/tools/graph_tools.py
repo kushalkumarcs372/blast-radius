@@ -20,6 +20,7 @@ class ToolResult:
     evidence: list[list[str]] = field(default_factory=list)
     cypher: list[str] = field(default_factory=list)
     error: str | None = None
+    extra: dict = field(default_factory=dict)  # context that is not a row, e.g. unaffected services
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,11 +60,16 @@ def blast_radius(g, service: str, max_hops: int = 4) -> ToolResult:
         if name not in best or hops < best[name][1]:
             best[name] = (tier, hops, path)
     ordered = sorted(best.items(), key=lambda kv: (kv[1][1], kv[0]))
+    q_all = "MATCH (s:Service) RETURN s.name ORDER BY s.name"
+    everything = [r[0] for r in _rows(g, q_all)]
+    unaffected = [n for n in everything if n not in best and n != service]
     return ToolResult(
         "blast_radius", params,
         [{"service": n, "tier": t, "hops": h} for n, (t, h, _) in ordered],
         evidence=[p for _, (_, _, p) in ordered],
-        cypher=[q],
+        cypher=[q, q_all],
+        extra={"total_services": len(everything), "affected_count": len(ordered),
+               "unaffected_services": unaffected},
     )
 
 
@@ -334,7 +340,112 @@ def decision_trace(g, service: str) -> ToolResult:
     )
 
 
+# --- what if we cut one dependency? -------------------------------------------
+
+def what_if_cut(g, service: str, cut_from: str, cut_to: str, max_hops: int = 4) -> ToolResult:
+    """Blast radius of `service` if the edge cut_from -> cut_to stopped carrying failures
+    (a circuit breaker, a fallback cache, or removing the dependency).
+
+    The graph returns every dependency path into `service`; a service stays at risk only if
+    at least one of its paths avoids the cut edge.
+    """
+    params = {"service": service, "cut_from": cut_from, "cut_to": cut_to, "max_hops": max_hops}
+    for name in (service, cut_from, cut_to):
+        if not _service_exists(g, name):
+            return _missing("what_if_cut", params, name)
+    q_edge = "MATCH (:Service {name: $a})-[r:DEPENDS_ON]->(:Service {name: $b}) RETURN count(r)"
+    if not _rows(g, q_edge, {"a": cut_from, "b": cut_to})[0][0]:
+        return ToolResult("what_if_cut", params, [], cypher=[q_edge],
+                          error=f"{cut_from} does not depend on {cut_to}")
+    q = (
+        f"MATCH p = (up:Service)-[:DEPENDS_ON*1..{_hops(max_hops)}]->(s:Service {{name: $service}}) "
+        "RETURN up.name, up.tier, length(p), [n IN nodes(p) | n.name]"
+    )
+    before: dict[str, tuple] = {}
+    after: dict[str, tuple] = {}
+    for name, tier, hops, path in _rows(g, q, {"service": service}):
+        uses_cut = any(a == cut_from and b == cut_to for a, b in zip(path, path[1:]))
+        for bucket in ((before,) if uses_cut else (before, after)):
+            if name not in bucket or hops < bucket[name][1]:
+                bucket[name] = (tier, hops, path)
+    saved = sorted(set(before) - set(after))
+    edge = lambda d: sorted(n for n, (t, _, _) in d.items() if t == "edge")  # noqa: E731
+    result = {
+        "cut": f"{cut_from} -> {cut_to}",
+        "at_risk_before": len(before), "at_risk_after": len(after),
+        "customer_facing_before": len(edge(before)), "customer_facing_after": len(edge(after)),
+        "saved": saved,
+        "still_at_risk": sorted(after),
+    }
+    return ToolResult("what_if_cut", params, [result],
+                      evidence=[after[n][2] for n in sorted(after)], cypher=[q_edge, q])
+
+
+def breaker_advice(g, service: str, max_hops: int = 4, limit: int = 3) -> ToolResult:
+    """Which single dependency, if it had a circuit breaker, protects the most from a `service` outage?
+
+    One traversal returns every path into `service`; for each edge on those paths we count the
+    services (customer-facing first) that would no longer have any path avoiding it.
+    """
+    params = {"service": service, "max_hops": max_hops}
+    if not _service_exists(g, service):
+        return _missing("breaker_advice", params, service)
+    q = (
+        f"MATCH p = (up:Service)-[:DEPENDS_ON*1..{_hops(max_hops)}]->(s:Service {{name: $service}}) "
+        "RETURN up.name, up.tier, [n IN nodes(p) | n.name]"
+    )
+    paths: dict[str, list] = {}
+    tier: dict[str, str] = {}
+    for name, t, path in _rows(g, q, {"service": service}):
+        paths.setdefault(name, []).append(list(zip(path, path[1:])))
+        tier[name] = t
+    edges = sorted({e for plist in paths.values() for p in plist for e in p})
+    ranked = []
+    for e in edges:
+        saved = sorted(n for n, plist in paths.items() if all(e in p for p in plist))
+        if saved:
+            ranked.append({"cut": f"{e[0]} -> {e[1]}", "cut_from": e[0], "cut_to": e[1],
+                           "saves": len(saved), "customer_facing_saved": sum(tier[n] == "edge" for n in saved),
+                           "saved": saved})
+    ranked.sort(key=lambda r: (-r["customer_facing_saved"], -r["saves"], r["cut"]))
+    top = ranked[:limit]
+    return ToolResult("breaker_advice", params, top, evidence=[[r["cut_from"], r["cut_to"]] for r in top], cypher=[q])
+
+
+# --- inventory and documents ----------------------------------------------------
+
+def list_services(g) -> ToolResult:
+    """Every service with its tier, owning team and number of direct dependencies."""
+    q = ("MATCH (s:Service) OPTIONAL MATCH (t:Team)-[:OWNS]->(s) OPTIONAL MATCH (s)-[:DEPENDS_ON]->(d:Service) "
+         "RETURN s.name AS name, s.tier, t.name, count(DISTINCT d) ORDER BY name")
+    rows = _rows(g, q)
+    return ToolResult("list_services", {},
+                      [{"service": n, "tier": t, "team": tm, "depends_on": k} for n, t, tm, k in rows],
+                      cypher=[q], extra={"total_services": len(rows)})
+
+
+def documents(g, service: str) -> ToolResult:
+    """Every document connected to a service: design decisions (ADRs) and postmortems of its incidents."""
+    params = {"service": service}
+    if not _service_exists(g, service):
+        return _missing("documents", params, service)
+    q_adr = ("MATCH (d:Decision)-[:ABOUT]->(:Service {name: $service}) MATCH (d)-[:SOURCED_FROM]->(doc:Document) "
+             "RETURN doc.id, doc.title, doc.type, d.id")
+    q_pm = ("MATCH (doc:Document)-[:MENTIONS]->(i:Incident)-[:AFFECTED]->(:Service {name: $service}) "
+            "RETURN DISTINCT doc.id, doc.title, doc.type, i.id")
+    rows = _rows(g, q_adr, {"service": service}) + _rows(g, q_pm, {"service": service})
+    return ToolResult(
+        "documents", params,
+        [{"document": d, "title": t, "type": ty, "linked_to": via} for d, t, ty, via in rows],
+        evidence=[[service, via, d] for d, _, _, via in rows], cypher=[q_adr, q_pm],
+    )
+
+
 TOOLS = {
+    "list_services": list_services,
+    "documents": documents,
+    "breaker_advice": breaker_advice,
+    "what_if_cut": what_if_cut,
     "open_alerts": open_alerts,
     "similar_incidents": similar_incidents,
     "runbook": runbook,

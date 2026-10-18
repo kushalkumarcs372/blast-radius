@@ -8,6 +8,7 @@ from ..tools import graph_tools as T
 from .base import summarize
 
 ROLE = ("You compare the current incident with past ones and name the most likely cause, with a confidence. "
+        "A suspect with verified=false was only mentioned in an incident report; say it is unconfirmed. "
         "In similar_past_incidents, change_that_caused_it is the change that CAUSED that past incident, "
         "never the fix. Do not recommend actions; the Responder agent does that.")
 WINDOW_MIN = 6 * 60
@@ -20,10 +21,34 @@ def score_suspect(suspect: dict, history_score: float) -> float:
     proximity (25%): on the alerting service or a direct neighbour scores higher
     history   (40%): a past incident here had the same signal and a similar cause
     """
-    recency = max(0.0, 1 - suspect["minutes_before_alert"] / WINDOW_MIN)
+    recency = max(0.0, min(1.0, 1 - suspect["minutes_before_alert"] / WINDOW_MIN))
     proximity = 1.0 if suspect["hops"] <= 1 else 0.5
     history = min(1.0, history_score / 5)
-    return round(0.35 * recency + 0.25 * proximity + 0.40 * history, 2)
+    score = 0.35 * recency + 0.25 * proximity + 0.40 * history
+    # A change someone mentioned in a report is a claim, not a deploy record: it counts less,
+    # so a rumour can never outrank a real deploy with the same evidence.
+    if not is_verified(suspect["deployment"]):
+        score *= UNVERIFIED_WEIGHT
+    return round(score, 2)
+
+
+UNVERIFIED_WEIGHT = 0.8              # a reported change, when nothing else is suspected
+UNVERIFIED_WEIGHT_WITH_EVIDENCE = 0.5  # a reported change, when real deploys are suspects too
+
+
+def is_verified(deployment_id: str) -> bool:
+    return not deployment_id.startswith("deploy-report-")
+
+
+def rank_suspects(assessed: list[dict]) -> list[dict]:
+    """Sort suspects by confidence. When real deploy records are also suspects, a change only
+    mentioned in a report counts half (not 80%): a rumour must not beat telemetry pointing elsewhere."""
+    if any(a["verified"] for a in assessed):
+        for a in assessed:
+            if not a["verified"]:
+                a["confidence"] = round(a["confidence"] * UNVERIFIED_WEIGHT_WITH_EVIDENCE / UNVERIFIED_WEIGHT, 2)
+    assessed.sort(key=lambda a: -a["confidence"])
+    return assessed
 
 
 def run(g, incident: str, session: str, llm=None) -> dict:
@@ -42,9 +67,10 @@ def run(g, incident: str, session: str, llm=None) -> dict:
             "deployment": s["deployment"], "service": s["service"], "summary": s["summary"],
             "author": s["author"], "minutes_before_alert": s["minutes_before_alert"], "hops": s["hops"],
             "confidence": score_suspect(s, best["score"] if best else 0.0),
+            "verified": is_verified(s["deployment"]),
             "best_match": best,
         })
-    assessed.sort(key=lambda a: -a["confidence"])
+    rank_suspects(assessed)
     likely = assessed[0] if assessed else None
 
     if likely is None:  # nothing changed recently: still look at history for this service
@@ -71,8 +97,10 @@ def run(g, incident: str, session: str, llm=None) -> dict:
     facts = {
         "incident": incident, "service": service, "signal": signal,
         "likely_cause": None if likely is None else {k: likely[k] for k in
-                        ("deployment", "service", "summary", "author", "minutes_before_alert", "confidence")},
-        "other_suspects": [{"deployment": a["deployment"], "confidence": a["confidence"]} for a in assessed[1:]],
+                        ("deployment", "service", "summary", "author", "minutes_before_alert", "confidence",
+                         "verified")},
+        "other_suspects": [{"deployment": a["deployment"], "service": a["service"], "confidence": a["confidence"],
+                            "verified": a["verified"]} for a in assessed[1:]],
         "similar_past_incidents": [
             {k: h[k] for k in ("incident", "title", "change_that_caused_it", "resolved_by", "minutes_to_resolve", "score")}
             for h in history if h
@@ -85,7 +113,9 @@ def run(g, incident: str, session: str, llm=None) -> dict:
                 f"{match['minutes_to_resolve']} min." if match and match["score"] >= 3 else "")
         fallback = (f"Likely cause: [{likely['deployment']}] '{likely['summary']}' on {likely['service']}, "
                     f"deployed {likely['minutes_before_alert']} min before the alert "
-                    f"(confidence {likely['confidence']:.2f}).{past}")
+                    f"(confidence {likely['confidence']:.2f})"
+                    f"{'' if likely['verified'] else ', reported in the incident text and not yet confirmed in deploy logs'}"
+                    f".{past}")
     else:
         fallback = (f"No recent deploy explains this alert on [{service}]. "
                     f"Check infrastructure and traffic; {len(history)} past incident(s) on this service may help.")

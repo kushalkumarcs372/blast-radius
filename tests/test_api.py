@@ -72,3 +72,28 @@ def test_ask_without_llm_explains_itself(client):
 def test_index_serves_the_ui(client):
     r = client.get("/")
     assert r.status_code == 200 and "Blast" in r.text
+
+
+def test_sandbox_starts_empty_and_needs_an_llm(client):
+    assert client.post("/api/sandbox/clear").json()["nodes"] == 0
+    assert "sandbox" in client.get("/api/tenants").json()
+    assert client.get("/api/graph?tenant=sandbox").json() == {"nodes": [], "edges": []}
+    assert client.get("/api/alerts?tenant=sandbox").json() == []
+    r = client.post("/api/sandbox/build", json={"text": "FoodDash: the app calls the gateway, which calls orders and payments."})
+    assert r.status_code == 422 and "LLM" in r.json()["detail"]
+    assert client.get("/api/sandbox/example").json()["text"].startswith("FoodDash")
+
+
+def test_incident_view_reports_grounding_and_loop_works(client):
+    client.post("/api/reset")
+    out = client.post("/api/respond", json={"alert": "alert-demo-live", "tenant": "acme"}).json()
+    inc = client.get(f"/api/incidents/{out['incident']}?tenant=acme").json()
+    for e in inc["episodes"]:
+        gr = e["grounding"]
+        assert gr["verified"] == gr["cited"] and gr["unverified"] == []  # template summaries cite real nodes
+    assert client.post(f"/api/incidents/{out['incident']}/resolve", json={"tenant": "acme"}).json()["status"] == "resolved"
+    assert client.post(f"/api/incidents/{out['incident']}/resolve", json={"tenant": "acme"}).status_code == 409
+    again = client.post(f"/api/incidents/{out['incident']}/refire", json={"tenant": "acme"}).json()
+    assert again["incident"] != out["incident"]
+    r = client.get("/api/tools/what_if_cut?tenant=acme&service=postgres-payments&cut_from=api-gateway&cut_to=checkout").json()
+    assert r["results"][0]["customer_facing_after"] == 0

@@ -10,6 +10,8 @@
   python -m blast_radius.cli ask "QUESTION" [--session S] [--incident INC]
   python -m blast_radius.cli llm-check       test the Gemini and Groq keys
   python -m blast_radius.cli report "TEXT"   describe an incident in your own words; agents investigate it
+  python -m blast_radius.cli resolve INC     close an incident with its confirmed cause (the graph learns)
+  python -m blast_radius.cli refire INC      fire a similar alert and run the agents again
 
 Add --tenant NAME to any command (default: acme).
 """
@@ -184,6 +186,13 @@ def main(argv: list[str]) -> None:
         show_memory(tenant, argv[1])
     elif cmd == "ask" and len(argv) >= 2:
         ask_cmd(tenant, argv[1:])
+    elif cmd == "resolve" and len(argv) == 2:
+        try:
+            print(memory.resolve_incident(graph(tenant), argv[1], "cli")["summary"])
+        except ValueError as exc:
+            print(exc)
+    elif cmd == "refire" and len(argv) == 2:
+        respond(tenant, memory.refire_alert(graph(tenant), argv[1]))
     elif cmd == "report" and len(argv) >= 2:
         report_cmd(tenant, " ".join(argv[1:]))
     elif cmd == "llm-check":

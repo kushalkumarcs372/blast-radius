@@ -20,6 +20,7 @@ def run(g, incident: str, session: str, llm=None) -> dict:
     fixers = T.fix_history(g, service)
     books = T.runbook(g, service)
     decisions = T.decision_trace(g, cause_service)
+    breaker = T.breaker_advice(g, service, limit=1)
 
     def on_call(res):
         if res.error or not res.results:
@@ -59,6 +60,12 @@ def run(g, incident: str, session: str, llm=None) -> dict:
     for b in books.results:
         actions.append(f"Follow runbook {b['runbook']}: {b['steps']}")
         cites.append(("Runbook", b["runbook"]))
+    for adv in breaker.results:
+        if adv["customer_facing_saved"] or adv["saves"] >= 2:
+            protected = (f"{adv['customer_facing_saved']} customer-facing service(s)" if adv["customer_facing_saved"]
+                         else f"{adv['saves']} service(s)")
+            actions.append(f"Longer term: a circuit breaker or fallback on {adv['cut']} would keep {protected} "
+                           f"({', '.join(adv['saved'])}) up the next time {service} fails.")
     for d in decisions.results[:1]:
         actions.append(f"Context: {d['title']} ({d['document_title']}). {d['summary']}")
         cites.append(("Document", d["document"]))
@@ -79,4 +86,4 @@ def run(g, incident: str, session: str, llm=None) -> dict:
     )
     return {"agent": "responder", "episode": episode, "incident": incident, "summary": summary,
             "summary_source": source, "findings": facts,
-            "cypher": own_alert.cypher + fixers.cypher + books.cypher + decisions.cypher}
+            "cypher": own_alert.cypher + fixers.cypher + books.cypher + decisions.cypher + breaker.cypher}

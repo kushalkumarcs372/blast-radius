@@ -127,9 +127,9 @@ def test_alert_is_no_longer_open(run):
 
 
 def test_score_suspect_bounds():
-    s = {"minutes_before_alert": 0, "hops": 0}
+    s = {"minutes_before_alert": 0, "hops": 0, "deployment": "deploy-0001"}
     assert score_suspect(s, 10) == 1.0
-    assert score_suspect({"minutes_before_alert": 360, "hops": 2}, 0) == 0.12
+    assert score_suspect({"minutes_before_alert": 360, "hops": 2, "deployment": "deploy-0002"}, 0) == 0.12
 
 
 def test_ask_uses_tools_and_remembers_the_conversation(run):
@@ -137,6 +137,8 @@ def test_ask_uses_tools_and_remembers_the_conversation(run):
     llm = LLM([Scripted([
         {"tool": "incident_memory", "args": {"incident": "inc-alert-demo-live"}},
         {"answer": "The likely cause is [deploy-demo-suspect]; it matches [inc-demo-old]."},
+        {"answer": "Rolling back [deploy-demo-suspect] is the first action."},  # pushed back: no tool yet
+        {"tool": "runbook", "args": {"service": "postgres-payments"}},
         {"answer": "Rolling back [deploy-demo-suspect] is the first action."},
     ])])
     first = ask_agent.ask(g, "What caused last night's payments alert?", llm, session="s-morning")
@@ -153,7 +155,7 @@ def test_ask_uses_tools_and_remembers_the_conversation(run):
 
 def test_ask_flags_invented_ids(run):
     g, _ = run
-    llm = LLM([Scripted([{"answer": "It was [deploy-1234]."}])])
+    llm = LLM([Scripted([{"answer": "It was [deploy-1234]."}, {"answer": "It was [deploy-1234]."}])])
     out = ask_agent.ask(g, "What broke?", llm, session="s-other")
     assert out["invented_ids"] == ["deploy-1234"]
 
@@ -168,3 +170,62 @@ def test_ask_rejects_unknown_tools(run):
     out = ask_agent.ask(g, "Who owns payments?", llm, session="s-tools")
     assert [s["tool"] for s in out["tools"]] == ["owners"]
     assert "ERROR" in llm.providers[0].prompts[-1]
+
+
+def test_ask_runs_several_tools_per_step_and_strips_invented_citations(run):
+    g, _ = run
+    llm = LLM([Scripted([
+        {"tools": [{"tool": "blast_radius", "args": {"service": "postgres-payments"}},
+                   {"tool": "connection_path", "args": {"source": "web-frontend", "target": "postgres-payments"}},
+                   {"tool": "documents", "args": {"service": "postgres-payments"}}]},
+        {"answer": "Unaffected include [kafka] [blast-rad-002]. Path via [checkout] [path-001]."},
+    ])])
+    out = ask_agent.ask(g, "Which services are unaffected, and how is web-frontend connected?", llm, session="s-multi")
+    assert [t["tool"] for t in out["tools"]] == ["blast_radius", "connection_path", "documents"]
+    assert out["invented_ids"] == ["blast-rad-002", "path-001"]
+    assert "[path-001]" not in out["answer"] and "[blast-rad-002]" not in out["answer"]
+    assert "[kafka]" in out["answer"] and set(out["cited"]) == {"kafka", "checkout"}
+    # The unaffected list reached the model, so it never has to guess service names.
+    assert "unaffected_services" in llm.providers[0].prompts[-1]
+
+
+def test_reported_change_counts_half_when_a_real_deploy_is_suspect():
+    from blast_radius.agents.investigator import rank_suspects
+
+    ranked = rank_suspects([
+        {"deployment": "deploy-report-ab-0", "verified": False, "confidence": 0.56},
+        {"deployment": "deploy-0042", "verified": True, "confidence": 0.45},
+    ])
+    assert ranked[0]["deployment"] == "deploy-0042" and ranked[1]["confidence"] == 0.35
+    alone = rank_suspects([{"deployment": "deploy-report-ab-0", "verified": False, "confidence": 0.56}])
+    assert alone[0]["confidence"] == 0.56  # no real deploy to compare with: keeps the 80% weight
+
+
+def test_incident_memory_shows_who_fixed_a_past_incident(run, acme):
+    g, _ = run
+    m = memory.incident_memory(g, "inc-demo-old")
+    fixer = next(p["name"] for p in acme.nodes["Person"]
+                 for _, pid, _, i, _ in acme.edges["RESOLVED"] if i == "inc-demo-old" and pid == p["id"])
+    assert m["resolved_by"] == [fixer]
+    assert m["caused_by"][0]["deployment"] == "deploy-demo-old" and "postgres-payments" in m["affected_services"]
+
+
+def test_ask_unbrackets_field_names(run):
+    g, _ = run
+    llm = LLM([Scripted([{"answer": "x"}, {"answer": "Safe: [kafka] [unaffected_services]."}])])
+    out = ask_agent.ask(g, "What is safe?", llm, session="s-fields")
+    assert out["answer"] == "Safe: unaffected services."  # [kafka] was never in a tool result, so it is removed
+
+
+def test_ask_must_call_a_tool_and_flags_names_not_in_the_graph(run):
+    g, _ = run
+    llm = LLM([Scripted([
+        {"answer": "Unaffected: svc-ledger-legacy. See ADR-42."},  # no tool called: pushed back
+        {"tool": "blast_radius", "args": {"service": "postgres-payments"}},
+        {"answer": "Unaffected: kafka and svc-ledger-legacy; see ADR-42 and deploy-demo-suspect, owned by customer-facing teams."},
+    ])])
+    out = ask_agent.ask(g, "Which services are unaffected?", llm, session="s-names")
+    assert [t["tool"] for t in out["tools"]] == ["blast_radius"]
+    assert "pushed" not in out["answer"] and "without calling any tool" in llm.providers[0].prompts[1]
+    assert out["unknown_names"] == ["adr-42", "svc-ledger-legacy"]  # deploy-demo-suspect is real; customer-facing is a word
+    assert "not found in the graph" in out["answer"]

@@ -89,6 +89,36 @@ def decision_trace(service: str, tenant: str = "acme") -> dict:
 
 
 @mcp.tool()
+def list_services(tenant: str = "acme") -> dict:
+    """Every service with its tier, owning team and number of direct dependencies."""
+    return T.list_services(_g(tenant)).to_dict()
+
+
+@mcp.tool()
+def documents(service: str, tenant: str = "acme") -> dict:
+    """Design decisions and incident postmortems connected to a service."""
+    return T.documents(_g(tenant), service).to_dict()
+
+
+@mcp.tool()
+def what_if_cut(service: str, cut_from: str, cut_to: str, tenant: str = "acme") -> dict:
+    """Blast radius of `service` if the dependency cut_from -> cut_to had a circuit breaker or fallback."""
+    return T.what_if_cut(_g(tenant), service, cut_from, cut_to).to_dict()
+
+
+@mcp.tool()
+def breaker_advice(service: str, tenant: str = "acme") -> dict:
+    """Where a single circuit breaker would protect the most services from an outage of `service`."""
+    return T.breaker_advice(_g(tenant), service).to_dict()
+
+
+@mcp.tool()
+def resolve_incident(incident: str, tenant: str = "acme") -> dict:
+    """Close an incident with its confirmed cause and fixer, so future alerts learn from it."""
+    return memory.resolve_incident(_g(tenant), incident, "mcp")
+
+
+@mcp.tool()
 def incident_memory(incident: str, tenant: str = "acme") -> dict:
     """Everything the agents recorded on an incident: findings, suspected causes, citations."""
     return memory.incident_memory(_g(tenant), incident)

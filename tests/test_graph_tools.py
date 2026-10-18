@@ -163,3 +163,38 @@ def test_similar_incidents_ranks_the_demo_match_first(g):
     top = res.results[0]
     assert top["incident"] == "inc-demo-old" and top["score"] >= 5
     assert top["change_that_caused_it"] == "Raise connection pool size"
+
+
+@pytest.mark.parametrize("cut", [("loyalty", "postgres-payments"), ("payments", "postgres-payments"),
+                                 ("api-gateway", "checkout")])
+def test_what_if_cut_matches_reference(g, acme, cut):
+    res = T.what_if_cut(g, "postgres-payments", *cut)
+    full = reference.blast_radius(acme, "postgres-payments")
+    after = reference.blast_radius_without(acme, "postgres-payments", *cut)
+    r = res.results[0]
+    assert r["at_risk_before"] == len(full) and set(r["still_at_risk"]) == set(after)
+    assert set(r["saved"]) == set(full) - set(after)
+
+
+def test_what_if_cut_rejects_a_missing_edge(g):
+    assert T.what_if_cut(g, "postgres-payments", "kafka", "checkout").error == "kafka does not depend on checkout"
+
+
+def test_breaker_advice_finds_the_gateway_edge(g):
+    top = T.breaker_advice(g, "postgres-payments", limit=1).results[0]
+    assert top["cut"] == "api-gateway -> checkout" and top["customer_facing_saved"] == 4
+
+
+def test_blast_radius_lists_unaffected_services(g, acme):
+    res = T.blast_radius(g, "postgres-payments")
+    affected = set(reference.blast_radius(acme, "postgres-payments"))
+    everything = {s["name"] for s in acme.nodes["Service"]}
+    assert set(res.extra["unaffected_services"]) == everything - affected - {"postgres-payments"}
+    assert res.extra["total_services"] == len(everything) == 38
+
+
+def test_list_services_and_documents(g):
+    assert len(T.list_services(g).results) == 38
+    docs = {d["document"]: d["type"] for d in T.documents(g, "postgres-payments").results}
+    assert docs.get("doc-pm-inc-demo-old") == "postmortem"
+    assert "doc-adr-01" in {d["document"] for d in T.documents(g, "payments").results}

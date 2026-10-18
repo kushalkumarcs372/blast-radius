@@ -46,8 +46,10 @@ def summarize(llm: LLM | None, agent: str, role: str, facts: dict, fallback: str
         out = llm.complete_json(SYSTEM.format(agent=agent, role=role), "FACTS:\n" + json.dumps(facts, default=str))
         text = str(out.get("summary", "")).strip()
         invented = set(_CITE.findall(text)) - known_ids(facts)
-        if not text or invented:
-            return fallback, "template (LLM output rejected)"
+        if not text:
+            return fallback, "template (LLM output rejected: empty)"
+        if invented:
+            return fallback, f"template (LLM output rejected: cited unknown {', '.join(sorted(invented))})"
         return text, llm.last_provider or "llm"
     except LLMUnavailable:
         return fallback, "template (LLM unavailable)"

@@ -80,6 +80,13 @@
   textarea { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
     border-radius: 6px; padding: 8px 10px; width: 100%; min-height: 76px; resize: vertical; }
   .facts { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .badge { display: inline-block; font-size: 11px; border-radius: 999px; padding: 1px 8px; margin-top: 6px;
+    border: 1px solid; }
+  .badge.ok { color: var(--ok); border-color: rgba(63,182,139,.45); background: rgba(63,182,139,.08); }
+  .badge.blocked { color: var(--warn); border-color: rgba(242,163,58,.45); background: rgba(242,163,58,.08); }
+  .whatif select { width: 100%; }
+  .delta { display: flex; gap: 8px; margin-top: 8px; }
+  .delta .stat { flex: 1; }
   .facts b { color: var(--text); font-weight: 500; }
   .answer { margin-top: 10px; }
   .tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -118,12 +125,15 @@
   </div>
   <aside>
     <section>
-      <h2>Describe an incident</h2>
+      <h2 id="report-title">Describe an incident</h2>
       <div class="card">
         <textarea id="report" maxlength="1500" placeholder="Write what you see, in your own words. The agents map it onto this company's graph and investigate."></textarea>
         <div class="row" style="margin-top:8px;justify-content:space-between">
           <div class="row" id="report-examples"></div>
-          <button class="primary" id="report-go">Investigate</button>
+          <div class="row">
+            <button id="sandbox-clear" hidden title="Delete the sandbox graph: 0 nodes, 0 edges">Clear graph</button>
+            <button class="primary" id="report-go">Investigate</button>
+          </div>
         </div>
         <div id="report-out"></div>
       </div>
@@ -139,13 +149,27 @@
     </section>
     <section id="actions-sec" hidden>
       <h2>Proposed actions</h2>
-      <div class="card"><ol class="actions" id="actions"></ol></div>
+      <div class="card"><ol class="actions" id="actions"></ol>
+        <div class="row" style="margin-top:10px" id="loop"></div>
+        <div id="loop-out" class="facts"></div>
+      </div>
+    </section>
+    <section id="whatif-sec" hidden>
+      <h2>What if…</h2>
+      <div class="card whatif">
+        <div id="breaker" class="facts" style="margin-top:0"></div>
+        <div class="row" style="margin-top:8px">
+          <select id="cut" style="flex:1;min-width:0"></select>
+          <button id="simulate">Simulate cut</button>
+        </div>
+        <div id="whatif-out"></div>
+      </div>
     </section>
     <section>
       <h2>Ask the graph</h2>
       <div class="card">
         <div class="ask-row">
-          <input id="q" placeholder="Who fixed this last time?" maxlength="500">
+          <input id="q" placeholder="Who fixed this last time?" maxlength="1500">
           <button id="ask">Ask</button>
         </div>
         <div class="row" style="margin-top:8px" id="suggest"></div>
@@ -206,9 +230,13 @@ async function loadGraph() {
       { selector: "edge.path", style: { width: 2.5, "line-color": "#f2a33a", "target-arrow-color": "#f2a33a", opacity: 1 } },
       { selector: "edge.cause", style: { width: 3, "line-color": "#6ba4ff", "target-arrow-color": "#6ba4ff",
         "line-style": "dashed", opacity: 1 } },
+      { selector: ".saved", style: { "background-color": "#3fb68b", opacity: 1 } },
+      { selector: "edge.cut", style: { width: 3, "line-color": "#3fb68b", "target-arrow-color": "#3fb68b",
+        "line-style": "dotted", opacity: 1 } },
     ],
     layout: { name: "breadthfirst", directed: true, spacingFactor: 1.15, padding: 40,
-      roots: g.nodes.filter((n) => n.tier === "edge").map((n) => "#" + n.id).join(",") },
+      roots: g.nodes.some((n) => n.tier === "edge") ? g.nodes.filter((n) => n.tier === "edge").map((n) => "#" + n.id).join(",") : undefined,
+      animate: state.tenant === "sandbox", animationDuration: 900 },
   });
   cy.on("tap", "node", (evt) => previewBlast(evt.target.id()));
   cy.on("tap", (evt) => { if (evt.target === cy) clearHighlight(); });
@@ -216,10 +244,25 @@ async function loadGraph() {
 
 function clearHighlight() {
   if (!cy) return;
-  cy.elements().removeClass("dim risk alerting suspect path cause");
+  cy.elements().removeClass("dim risk alerting suspect path cause saved cut");
 }
 function edgeBetween(a, b) {
   return cy.getElementById(`${a}->${b}`).length ? cy.getElementById(`${a}->${b}`) : cy.getElementById(`${b}->${a}`);
+}
+let animTimers = [];
+function animateHighlight(args) {
+  // Replays the traversal the agents ran: the alerting service, then each hop outward, then the cause.
+  animTimers.forEach(clearTimeout); animTimers = [];
+  const maxHop = Math.max(0, ...(args.atRisk || []).map((r) => r.hops));
+  for (let h = 0; h <= maxHop + 1; h++) {
+    animTimers.push(setTimeout(() => {
+      highlight({ alerting: args.alerting, atRisk: (args.atRisk || []).filter((r) => r.hops <= h),
+                  suspects: h > maxHop ? args.suspects : [] });
+      $("hint").innerHTML = h === 0 ? `Triage starts at <b>${esc(args.alerting)}</b>`
+        : h <= maxHop ? `Triage: hop ${h} · ${(args.atRisk || []).filter((r) => r.hops <= h).length} services at risk`
+        : `Investigator: blue dashed link to the suspect deploy`;
+    }, h * 450));
+  }
 }
 function highlight({ alerting, atRisk = [], suspects = [] }) {
   clearHighlight();
@@ -250,7 +293,9 @@ async function loadAlerts() {
       <div class="body"><div class="title">${esc(a.signal)}</div>
         <div class="meta"><span class="mono">${esc(a.service)}</span> · ${esc(a.severity)} · ${ago(a.ts)}</div></div>
       <button class="primary" data-alert="${esc(a.alert)}">Run agents</button>
-    </div>`).join("") : `<div class="row" style="justify-content:space-between">
+    </div>`).join("") : state.tenant === "sandbox"
+      ? `<div class="empty">No open alerts. Any live alert in your description is investigated automatically and shown below.</div>`
+      : `<div class="row" style="justify-content:space-between">
       <div class="empty">No open alerts. The agents already handled the demo alert; open it under Past sessions, or fire it again.</div>
       <button class="primary" id="refire">Fire demo alert</button></div>`;
   $("alerts").querySelectorAll("button[data-alert]").forEach((b) => b.onclick = () => respond(b.dataset.alert, b));
@@ -283,7 +328,9 @@ const EXAMPLES = {
 };
 function renderExamples() {
   $("report-examples").innerHTML = `<button class="chip" style="cursor:pointer">Use an example</button>`;
-  $("report-examples").querySelector("button").onclick = () => { $("report").value = EXAMPLES[state.tenant] || EXAMPLES.acme; };
+  $("report-examples").querySelector("button").onclick = async () => {
+    $("report").value = state.tenant === "sandbox" ? (await api("/api/sandbox/example")).text : (EXAMPLES[state.tenant] || EXAMPLES.acme);
+  };
 }
 async function investigateReport() {
   const text = $("report").value.trim(); if (!text) return;
@@ -291,7 +338,18 @@ async function investigateReport() {
   $("report-out").innerHTML = `<div class="facts">Reading the report and mapping it onto the graph…</div>`;
   status("Understanding report → Triage → Investigator → Responder…");
   try {
-    const out = await api("/api/report", { method: "POST", body: JSON.stringify({ text, tenant: state.tenant }) });
+    if (state.tenant === "sandbox") { await buildSandbox(text); btn.disabled = false; return; }
+    const out = await api("/api/report", { method: "POST", body: JSON.stringify({
+      text, tenant: state.tenant, session: state.session, incident: state.incident }) });
+    if (out.routed === "ask") {  // a question typed here is answered by the assistant
+      $("report-out").innerHTML = `<div class="facts">That reads like a question, so the assistant answered it:</div>
+        <div class="answer">${cites(out.answer)}</div>
+        <div class="tools">${out.tools.map((t) => `<span class="chip">${esc(t.tool)}</span>`).join("")}</div>
+        ${out.cited.length ? `<span class="badge ok">${out.cited.length} cited ids found in FalkorDB tool results</span> ` : ""}
+        ${out.invented_ids.length ? `<span class="badge blocked">Guard removed invented citations: ${esc(out.invented_ids.join(", "))}</span>` : ""}
+        ${(out.unknown_names || []).length ? `<span class="badge blocked">Not in the graph: ${esc(out.unknown_names.join(", "))}</span>` : ""}`;
+      status(""); btn.disabled = false; return;
+    }
     const f = out.facts;
     $("report-out").innerHTML = `<div class="facts">Understood by <b>${esc(f.parsed_by)}</b>:
       <b>${esc(f.signal)}</b> on <b class="mono">${esc(f.service)}</b> · ${esc(f.severity)} · started ${f.minutes_ago} min ago
@@ -302,6 +360,105 @@ async function investigateReport() {
     await loadIncidents();
   } catch (e) { $("report-out").innerHTML = `<div class="warn">${esc(e.message)}</div>`; status(""); }
   btn.disabled = false; setTimeout(() => status(""), 2500);
+}
+
+// ---------- resolve & learn ----------
+function renderLoop(m) {
+  const resolved = m.status === "resolved";
+  $("loop").innerHTML = resolved
+    ? `<span class="badge ok" style="margin:0">Resolved · learned into the graph</span>
+       <button id="refire-similar">Fire a similar alert</button>`
+    : `<button class="primary" id="resolve">Mark resolved (confirm top cause)</button>`;
+  $("loop-out").innerHTML = resolved ? "Fire the same kind of alert again: the Investigator will now compare it with this incident." : "";
+  if ($("resolve")) $("resolve").onclick = async () => {
+    $("resolve").disabled = true;
+    try {
+      const r = await api(`/api/incidents/${m.incident}/resolve`, { method: "POST", body: JSON.stringify({ tenant: state.tenant, session: state.session }) });
+      await showIncident(m.incident); await loadIncidents();
+      $("loop-out").innerHTML = cites(r.summary);
+    } catch (e) { $("loop-out").innerHTML = `<span class="warn">${esc(e.message)}</span>`; }
+  };
+  if ($("refire-similar")) $("refire-similar").onclick = async () => {
+    $("refire-similar").disabled = true; status("New alert → Triage → Investigator → Responder…");
+    try {
+      const out = await api(`/api/incidents/${m.incident}/refire`, { method: "POST", body: JSON.stringify({ tenant: state.tenant }) });
+      status(`Done in ${(out.total_ms / 1000).toFixed(1)} s`);
+      await showIncident(out.incident, out.steps); await loadIncidents();
+      $("loop-out").innerHTML = `New incident <span class="cite">${esc(out.incident)}</span>: see the Investigator compare it with the one you just resolved.`;
+    } catch (e) { $("loop-out").innerHTML = `<span class="warn">${esc(e.message)}</span>`; status(""); }
+    setTimeout(() => status(""), 2500);
+  };
+}
+
+// ---------- what if ----------
+async function renderWhatIf(tri) {
+  const edges = [...new Set((tri.at_risk || []).flatMap((r) => r.path.slice(0, -1).map((a, i) => `${a} -> ${r.path[i + 1]}`)))].sort();
+  $("whatif-sec").hidden = !edges.length;
+  if (!edges.length) return;
+  $("cut").innerHTML = edges.map((e) => `<option>${esc(e)}</option>`).join("");
+  $("whatif-out").innerHTML = "";
+  try {
+    const adv = await api(`/api/tools/breaker_advice?tenant=${state.tenant}&service=${encodeURIComponent(tri.service)}`);
+    const top = adv.results[0];
+    $("breaker").innerHTML = top
+      ? `Best single circuit breaker: <b class="mono">${esc(top.cut)}</b> keeps <b>${top.saves}</b> service(s) up${top.customer_facing_saved ? `, ${top.customer_facing_saved} customer-facing` : ""}. <span class="mono">breaker_advice</span>`
+      : "No single dependency cut protects anything here: every service has another path to the failure.";
+    if (top) $("cut").value = top.cut;
+  } catch (e) { $("breaker").textContent = ""; }
+  $("simulate").onclick = async () => {
+    const [from, to] = $("cut").value.split(" -> ");
+    const r = await api(`/api/tools/what_if_cut?tenant=${state.tenant}&service=${encodeURIComponent(tri.service)}&cut_from=${encodeURIComponent(from)}&cut_to=${encodeURIComponent(to)}`);
+    if (r.error) { $("whatif-out").innerHTML = `<div class="warn">${esc(r.error)}</div>`; return; }
+    const x = r.results[0];
+    $("whatif-out").innerHTML = `<div class="delta">
+        <div class="stat"><b>${x.at_risk_before} → ${x.at_risk_after}</b><span>services at risk</span></div>
+        <div class="stat"><b>${x.customer_facing_before} → ${x.customer_facing_after}</b><span>customer-facing</span></div></div>
+      <div class="facts">${x.saved.length ? `Saved: <b>${esc(x.saved.join(", "))}</b>` : "Nothing saved: every affected service has another path to the failure."}</div>`;
+    animTimers.forEach(clearTimeout);
+    highlight({ alerting: tri.service, atRisk: (tri.at_risk || []).filter((a) => x.still_at_risk.includes(a.service)), suspects: [] });
+    x.saved.forEach((n) => cy.getElementById(n).removeClass("dim").addClass("saved"));
+    edgeBetween(from, to).removeClass("dim path").addClass("cut");
+    $("hint").innerHTML = `What if <b>${esc(from)} → ${esc(to)}</b> had a circuit breaker: green = saved`;
+  };
+}
+
+// ---------- sandbox: build a company graph from a description ----------
+async function buildSandbox(text) {
+  $("report-out").innerHTML = `<div class="facts">Extracting services, dependencies, teams, deploys and incidents…</div>`;
+  status("Building the graph from your description…");
+  const sum = await api("/api/sandbox/build", { method: "POST", body: JSON.stringify({ text }) });
+  $("report-out").innerHTML = `<div class="facts">Built by <b>${esc(sum.parsed_by || "")}</b>${sum.company ? ` for <b>${esc(sum.company)}</b>` : ""}:
+    <b>${sum.services}</b> services · <b>${sum.dependencies}</b> dependencies · <b>${sum.teams}</b> teams ·
+    <b>${sum.people}</b> people · <b>${sum.deployments}</b> deploys · <b>${sum.past_incidents}</b> past incidents
+    → <b>${sum.nodes}</b> nodes, <b>${sum.edges}</b> edges in FalkorDB
+    ${sum.dropped.length ? `<br>skipped: ${esc(sum.dropped.join("; "))}` : ""}
+    ${sum.alert ? "" : "<br>No live alert in the description, so the agents have nothing to investigate yet."}</div>`;
+  state.incident = null; $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("whatif-sec").hidden = true;
+  await loadGraph(); await loadAlerts(); await loadIncidents();
+  if (sum.alert) {
+    status("Graph built. Triage → Investigator → Responder running…");
+    const out = await api("/api/respond", { method: "POST", body: JSON.stringify({ alert: sum.alert, tenant: "sandbox" }) });
+    status(`Done in ${(out.total_ms / 1000).toFixed(1)} s`);
+    await showIncident(out.incident, out.steps); await loadAlerts(); await loadIncidents();
+  } else { status(""); }
+  setTimeout(() => status(""), 2500);
+}
+async function clearSandbox() {
+  await api("/api/sandbox/clear", { method: "POST" });
+  $("report-out").innerHTML = `<div class="facts">Sandbox graph deleted: <b>0</b> nodes, <b>0</b> edges.</div>`;
+  state.incident = null; $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("whatif-sec").hidden = true;
+  await loadGraph(); await loadAlerts(); await loadIncidents();
+}
+function setMode() {
+  const sb = state.tenant === "sandbox";
+  $("report-title").textContent = sb ? "Build a company from a description" : "Describe an incident";
+  $("report").placeholder = sb
+    ? "Describe a company: its services and what calls what, teams and who is on call, recent deploys, past incidents, and what is failing right now."
+    : "Write what you see, in your own words. The agents map it onto this company's graph and investigate.";
+  $("report").style.minHeight = sb ? "150px" : "76px";
+  $("report").maxLength = sb ? 6000 : 1500;
+  $("report-go").textContent = sb ? "Build graph & investigate" : "Investigate";
+  $("sandbox-clear").hidden = !sb;
 }
 
 async function showIncident(id, steps) {
@@ -319,17 +476,28 @@ async function showIncident(id, steps) {
     <div class="stat"><b>${cause ? Math.round(cause.confidence * 100) + "%" : "–"}</b><span>cause confidence</span></div>`;
   const ms = Object.fromEntries((steps || []).map((s) => [s.agent, s]));
   $("timeline").innerHTML = m.episodes.filter((e) => e.agent !== "assistant").map((e) => {
-    const s = ms[e.agent];
+    const s = e.kind === "resolution" ? null : ms[e.agent];
+    const src = (s && s.summary_source) || e.summary_source || "";
+    const gr = e.grounding || { cited: 0, verified: 0, unverified: [], evidence_nodes: e.cites.length };
+    const badge = src.includes("rejected")
+      ? `<span class="badge blocked">Guard blocked the LLM summary (${esc(src.replace(/^template \(LLM output rejected: ?/, "").replace(/\)$/, ""))}); graph template shown</span>`
+      : gr.cited ? `<span class="badge ${gr.unverified.length ? "blocked" : "ok"}">${gr.verified}/${gr.cited} cited ids verified in FalkorDB · ${gr.evidence_nodes} evidence nodes</span>`
+      : `<span class="badge ok">${gr.evidence_nodes} evidence nodes in FalkorDB</span>`;
     return `<div class="agent">
-      <div class="name">${esc(e.agent)}<small>${s ? s.ms + " ms · " + esc(s.summary_source) : esc(e.session)}${e.handed_off_to ? " → " + esc(e.handed_off_to) : ""}</small></div>
-      <p>${cites(e.summary)}</p>
+      <div class="name">${esc(e.agent)}${e.kind === "resolution" ? " · resolution" : ""}<small>${s ? s.ms + " ms · " + esc(s.summary_source) : esc(e.session)}${e.handed_off_to ? " → " + esc(e.handed_off_to) : ""}</small></div>
+      <p>${cites(e.summary)}</p>${badge}
       <details><summary>graph evidence (${e.cites.length} nodes)${s ? " · Cypher" : ""}</summary>
         <pre>${esc(e.cites.join("\n"))}</pre>${s ? `<pre>${esc(s.cypher.join("\n\n"))}</pre>` : ""}</details>
     </div>`;
   }).join("");
   $("actions").innerHTML = (resp.actions || []).map((a) => `<li>${cites(a)}</li>`).join("");
-  highlight({ alerting: tri.service, atRisk: tri.at_risk || [], suspects: tri.suspects || [] });
-  $("hint").innerHTML = `Orange: impact paths from <b>${esc(tri.service)}</b> · blue dashed: link to the suspect deploy`;
+  const args = { alerting: tri.service, atRisk: tri.at_risk || [], suspects: tri.suspects || [] };
+  if (steps) animateHighlight(args); else {
+    highlight(args);
+    $("hint").innerHTML = `Orange: impact paths from <b>${esc(tri.service)}</b> · blue dashed: link to the suspect deploy`;
+  }
+  renderLoop(m);
+  renderWhatIf(tri);
   renderSuggestions();
 }
 
@@ -351,7 +519,9 @@ async function ask() {
       question, tenant: state.tenant, session: state.session, incident: state.incident }) });
     $("answer").innerHTML = `<div>${cites(out.answer)}</div>
       <div class="tools">${out.tools.map((t) => `<span class="chip">${esc(t.tool)}(${esc(Object.values(t.args).join(", "))})</span>`).join("")}</div>
-      ${out.invented_ids.length ? `<div class="warn">Flagged: ${esc(out.invented_ids.join(", "))} not found in the graph</div>` : ""}
+      ${out.cited.length ? `<span class="badge ok">${out.cited.length} cited id${out.cited.length > 1 ? "s" : ""} found in FalkorDB tool results</span> ` : ""}
+      ${out.invented_ids.length ? `<span class="badge blocked">Guard removed ${out.invented_ids.length} invented citation${out.invented_ids.length > 1 ? "s" : ""}: ${esc(out.invented_ids.join(", "))}</span>` : ""}
+      ${(out.unknown_names || []).length ? `<span class="badge blocked">Not in the graph: ${esc(out.unknown_names.join(", "))}</span>` : ""}
       <div class="meta" style="margin-top:6px">${esc(out.provider || "")} · saved to graph memory (session ${esc(state.session)})</div>`;
   } catch (e) { $("answer").innerHTML = `<div class="warn">${esc(e.message)}</div>`; }
   $("ask").disabled = false;
@@ -360,8 +530,8 @@ async function ask() {
 // ---------- boot ----------
 async function switchTenant(t) {
   state.tenant = t; state.incident = null; state.alerting = null; state.cause = null;
-  $("report-out").innerHTML = ""; renderExamples();
-  $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("answer").innerHTML = "";
+  $("report-out").innerHTML = ""; $("report").value = ""; renderExamples(); setMode();
+  $("incident-sec").hidden = true; $("actions-sec").hidden = true; $("whatif-sec").hidden = true; $("answer").innerHTML = "";
   await loadGraph(); await loadAlerts(); await loadIncidents(); renderSuggestions();
   // A visitor arriving after the alert was handled sees the latest incident instead of an empty map.
   const [alerts, incidents] = await Promise.all([api(`/api/alerts?tenant=${t}`), api(`/api/incidents?tenant=${t}`)]);
@@ -370,6 +540,7 @@ async function switchTenant(t) {
 $("tenant").onchange = (e) => switchTenant(e.target.value);
 $("ask").onclick = ask;
 $("report-go").onclick = investigateReport;
+$("sandbox-clear").onclick = clearSandbox;
 $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
 $("reset").onclick = async () => {
   $("reset").disabled = true; status("Reloading synthetic companies…");
@@ -380,7 +551,7 @@ $("reset").onclick = async () => {
 (async () => {
   try {
     const tenants = await api("/api/tenants");
-    $("tenant").innerHTML = tenants.map((t) => `<option ${t === "acme" ? "selected" : ""}>${esc(t)}</option>`).join("");
+    $("tenant").innerHTML = tenants.map((t) => `<option value="${esc(t)}" ${t === "acme" ? "selected" : ""}>${t === "sandbox" ? "sandbox (build your own)" : esc(t)}</option>`).join("");
     await switchTenant(tenants.includes("acme") ? "acme" : tenants[0]);
   } catch (e) { status("Cannot reach the API: " + e.message); }
 })();

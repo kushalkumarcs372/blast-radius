@@ -43,6 +43,23 @@ Open http://localhost:8000. Click **Run agents** on the open alert: the map dims
 
 The **Describe an incident** box (or `python -m blast_radius.cli report "..."`) takes any free-text report, for example *"Checkout is throwing 500 errors for the last 15 minutes. We pushed a pricing rules change about 25 minutes ago."* The LLM maps it onto the company's graph: the failing service, the symptom (reusing a known signal when one fits), the severity, and any changes mentioned. Every service it names is checked against the graph, so it cannot invent one; anything that does not match is shown as ignored. The facts are written to FalkorDB as an `Alert` (and `Deployment` nodes for reported changes), and the three agents investigate it like any other alert. Without an LLM key, a keyword fallback finds service names in the text.
 
+### Build a company from a description (sandbox)
+
+Pick **sandbox (build your own)** in the company menu. It starts as an empty graph. Paste a paragraph describing any company (services and what calls what, teams and who is on call, recent deploys, past incidents, what is failing now) and click **Build graph & investigate**. The LLM extracts the entities; `blast_radius/ingest.py` validates them (normalised names, no dangling references, de-duplicated edges, size limits), wipes the sandbox graph and loads the new one into FalkorDB, keeping the original text as provenance. If the text describes something failing, the three agents investigate it immediately. **Clear graph** deletes it again (0 nodes, 0 edges). Nothing in the sandbox comes from the synthetic generator.
+
+Ids written in the description (for example `deploy-quant-804` or `inc-ledger-099`) are kept, so they can be asked about later. A gateway that user-facing apps call is not counted as customer-facing, whatever tier the model gave it.
+
+Changes mentioned in an incident report are stored as `deploy-report-*` and treated as unverified claims: they count 20% less in the cause confidence, and 50% less when real deploy records are also suspects, and the Investigator says they are unconfirmed. A question typed into the report box is answered by the assistant instead.
+
+**Ask the graph** can request up to four tools per step (eight steps), so a question with several parts gets every tool it needs. `blast_radius` also returns the unaffected services, so the model never has to guess names. Any citation in an answer that does not appear in a tool result is removed and reported under the answer.
+
+### What if, resolve and learn
+
+- **What if…** Under each incident, pick any dependency on the impact paths and **Simulate cut**: the graph recomputes the blast radius as if that edge had a circuit breaker or fallback, and the map turns the saved services green. `breaker_advice` names the single best place for a breaker (for the acme outage: `api-gateway -> checkout` keeps all 4 customer-facing services up), and the Responder adds it as a long-term action.
+- **Mark resolved** writes the outcome back into the graph: the confirmed cause (`CAUSED_BY`), who fixed it (`RESOLVED`), a linked postmortem `Document`, and a resolution Episode. **Fire a similar alert** then runs the agents again: the Investigator now ranks the incident you just resolved as the closest match, and `fix_history` counts the new fix. That is the procedural-memory loop: every resolution becomes experience.
+- **Grounding badges** on every agent card show how many cited ids were verified to exist in FalkorDB, and when the guard blocked an LLM summary for citing an unknown id, which id it was.
+- The map **replays the traversal**: the alerting service, then each hop outward, then the link to the suspect deploy.
+
 ### MCP server
 
 The same graph tools are exposed over the Model Context Protocol, so any MCP client can drive them. For Claude Desktop, add to `claude_desktop_config.json` (adjust the paths):
@@ -59,7 +76,7 @@ The same graph tools are exposed over the Model Context Protocol, so any MCP cli
 }
 ```
 
-Tools exposed: `tenants`, `open_alerts`, `blast_radius`, `dependencies`, `recent_deploys`, `critical_services`, `connection_path`, `owners`, `fix_history`, `similar_incidents`, `runbook`, `decision_trace`, `incident_memory`, `list_incidents`, `respond_to_alert`.
+Tools exposed: `tenants`, `open_alerts`, `blast_radius`, `dependencies`, `recent_deploys`, `critical_services`, `connection_path`, `owners`, `fix_history`, `similar_incidents`, `runbook`, `decision_trace`, `what_if_cut`, `breaker_advice`, `incident_memory`, `list_incidents`, `respond_to_alert`, `resolve_incident`.
 
 ### Command line
 
@@ -157,6 +174,10 @@ All queries live in `blast_radius/tools/graph_tools.py`. Hop limits are validate
 | `similar_incidents` | Which past incidents look like this one? | `MATCH (past:Incident)-[:AFFECTED]->(s:Service {name: $service}) WHERE past.status = 'resolved' OPTIONAL MATCH (past)-[:CAUSED_BY]->(d:Deployment)-[:CHANGED]->(ds:Service) ...` |
 | `runbook` | How do I handle X? | `MATCH (r:Runbook)-[:FOR]->(s:Service {name: $service}) RETURN ...` |
 | `decision_trace` | Why is X built this way? | `MATCH (d:Decision)-[:ABOUT]->(s:Service {name: $service}) MATCH (d)-[:SOURCED_FROM]->(doc:Document) RETURN ...` |
+| `list_services` | What services exist? | `MATCH (s:Service) OPTIONAL MATCH (t:Team)-[:OWNS]->(s) OPTIONAL MATCH (s)-[:DEPENDS_ON]->(d:Service) RETURN ...` |
+| `documents` | What is written about X? | ADRs via `(Decision)-[:ABOUT]->(Service)` plus postmortems via `(Document)-[:MENTIONS]->(Incident)-[:AFFECTED]->(Service)` |
+| `what_if_cut` | What if A -> B had a circuit breaker? | Same path query as `blast_radius`; a service stays at risk only if one of its paths avoids the cut edge |
+| `breaker_advice` | Where would one circuit breaker help most? | One path query into the failing service; each edge on those paths is scored by the services whose every path uses it |
 | `open_alerts` | Which alerts have no incident yet? | `MATCH (a:Alert)-[:FIRED_ON]->(s:Service) OPTIONAL MATCH (i:Incident)-[:TRIGGERED_BY]->(a) WITH a, s, i WHERE i IS NULL RETURN ...` |
 
 ## How the queries are verified

@@ -62,6 +62,14 @@ def test_keyword_fallback_without_llm():
         parse_report(FakeGraph(), "something is broken somewhere", None)
 
 
+def test_questions_are_recognised():
+    from blast_radius.intake import looks_like_question
+
+    assert looks_like_question("Who owns checkout?")
+    assert looks_like_question("tell me the blast radius of kafka")
+    assert not looks_like_question("Checkout is throwing 500 errors since 10 minutes.")
+
+
 def test_length_limits():
     with pytest.raises(ReportError):
         parse_report(FakeGraph(), "short", None)
@@ -106,5 +114,17 @@ def test_report_becomes_an_investigated_incident(g):
     assert tri["service"] == "checkout" and "api-gateway" in tri["customer_facing_at_risk"]
     assert [s["service"] for s in tri["suspects"]] == ["pricing"]
     assert tri["suspects"][0]["minutes_before_alert"] == 10
-    assert inv["likely_cause"]["service"] == "pricing" and inv["likely_cause"]["confidence"] >= 0.5
-    assert resp["actions"][0].startswith("Roll back deploy-report-")
+    cause = inv["likely_cause"]
+    assert cause["service"] == "pricing" and cause["verified"] is False  # a reported change, not a deploy record
+    assert "deploy-report-" in resp["actions"][0]
+
+
+def test_reported_change_counts_less_than_a_verified_deploy():
+    from blast_radius.agents.investigator import score_suspect
+
+    same = {"minutes_before_alert": 10, "hops": 0}
+    real = score_suspect({**same, "deployment": "deploy-0042"}, 0)
+    rumour = score_suspect({**same, "deployment": "deploy-report-ab12cd34-0"}, 0)
+    assert rumour < real
+    # Clock skew (change after the alert) never pushes recency above 1.
+    assert score_suspect({"minutes_before_alert": -30, "hops": 0, "deployment": "deploy-1"}, 5) == 1.0

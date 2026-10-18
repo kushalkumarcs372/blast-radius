@@ -69,3 +69,10 @@ def fix_counts(data: CompanyData, service: str) -> dict[str, int]:
         if i in affected:
             counts[person[p]].add(i)
     return {k: len(v) for k, v in counts.items()}
+
+
+def blast_radius_without(data: CompanyData, service: str, cut_from: str, cut_to: str, max_hops: int = 4) -> dict[str, int]:
+    """Blast radius with one dependency edge removed."""
+    _, inc = _service_graph(data)
+    inc[cut_to] = inc[cut_to] - {cut_from}
+    return _bfs(inc, service, max_hops)
